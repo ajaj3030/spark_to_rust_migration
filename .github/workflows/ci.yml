@@ -19,6 +19,9 @@ jobs:
         working-directory: rust_pipeline
     steps:
       - uses: actions/checkout@v4
+      # The bundled librdkafka build links libcurl on Linux
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
