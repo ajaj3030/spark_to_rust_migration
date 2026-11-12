@@ -42,10 +42,10 @@ rust-pipeline validate  ──  compares each Spark table with its Rust twin (th
 |---|---|---|---|
 | Telemetry enrichment (`streaming_job.py`) | ✅ | ✅ `rust-pipeline stream` | `validate` |
 | Vehicle state MERGE (`vehicle_state_job.py`) | ✅ | ✅ `rust-pipeline state` | `validate --state` |
-| Battery health daily (`analytics/battery_health_daily.py`) | ✅ | ❌ placeholder | parity test (ignored until ported) |
-| Charging sessions (`analytics/charging_sessions.py`) | ✅ | ❌ placeholder | parity test (ignored until ported) |
-| OTA rollout (`analytics/ota_rollout.py`) | ✅ | ❌ placeholder | parity test (ignored until ported) |
-| Diagnostic alerts (`analytics/diagnostic_alerts.py`) | ✅ | ❌ placeholder | parity test (ignored until ported) |
+| Batch analytics (`analytics/*.py`, 4 jobs) | ✅ | one file per job in `rust_pipeline/src/analytics/` | parity test per job |
+
+An analytics job is ported once its parity test is no longer `#[ignore]`d;
+the dashboard's Migration page shows each job's status live.
 
 ## Batch analytics jobs
 
@@ -135,7 +135,8 @@ conflicts. Done means:
 2. the `#[ignore]` is removed from the job's parity test
 3. CI is green: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
    `cargo test`
-4. the migration status table above is updated
+
+A port changes only that job's file, so parallel ports never conflict.
 
 Rust reproduces Spark's `round()` exactly (`transforms/rounding.rs`): Spark
 rounds HALF_UP on the decimal form of the double, so `round(1.005, 2)` is
