@@ -31,7 +31,7 @@ pub async fn write_batch(
     Ok(())
 }
 
-/// Overwrite a Delta table (used for account upsert when merge isn't available).
+/// Overwrite a Delta table (not used by the current pipelines).
 pub async fn write_batch_overwrite(
     table_path: &str,
     batch: RecordBatch,

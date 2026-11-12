@@ -1,360 +1,201 @@
 """
-Reusable Spark transformation library for financial transaction data.
+Reusable Spark transformation library for vehicle telemetry.
 
-Demonstrates key Spark concepts:
-  1. Column expressions (withColumn, select, expr)
-  2. UDFs — User-Defined Functions (Python callables → Spark columns)
-  3. When/otherwise — conditional logic
-  4. Regex extraction — parsing structured strings
-  5. Math & rounding — derived numeric columns
-  6. Null handling — coalesce, na.fill
-  7. String manipulation — concat, upper, substring
-  8. Timestamp arithmetic — datediff, hour extraction
-  9. Hashing — SHA-256 for anonymization
-  10. Monotonically increasing ID — row numbering
+The streaming job applies these in order to every telemetry micro-batch.
+The Rust port (rust_pipeline/src/transforms/) mirrors each function one to
+one; `rust-pipeline validate` checks the two outputs match.
+
+Privacy contract: the enriched table must never contain the raw VIN or
+precise GPS. add_location_features coarsens coordinates to 2 dp (~1 km) and
+add_anonymized_columns replaces the VIN with a SHA-256 hash; both drop the
+raw columns.
 """
 
-import math
 from typing import Optional
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, IntegerType, StringType
+from pyspark.sql.types import StringType
+
+THERMAL_MAX_CELL_TEMP_C = 55.0
+THERMAL_CELL_SPREAD_C = 15.0
+SERVICE_HEALTH_THRESHOLD = 70.0
+
+FAULT_CHARGE_STATES = [
+    "CHARGE_STATE_CHARGING_END_ERROR",
+    "CHARGE_STATE_EVSE_MALFUNCTION",
+    "CHARGE_STATE_TEMP_PROTECTION",
+    "CHARGE_STATE_AUTHENTICATION_PNC_FAILURE",
+    "CHARGE_STATE_CABLE_CONNECTION_FAULT",
+    "CHARGE_STATE_INTERNAL_HARDWARE_FAULT",
+]
+
+FAILED_UPDATE_STATES = [
+    "UPDATE_STATE_FAILED",
+    "UPDATE_FAILED_DRIVE_ALLOWED",
+    "UPDATE_FAILED_NO_ACTION",
+]
+
+PII_COLUMNS = ["vin", "latitude", "longitude"]
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. UDFs  —  Python functions registered as Spark column ops
+# UDFs
 # ─────────────────────────────────────────────────────────────
 
 @F.udf(returnType=StringType())
-def classify_risk(risk_score: Optional[float]) -> str:
-    """Classify risk_score into named tiers.
-
-    Spark concept: UDF — wraps arbitrary Python logic so it can run
-    row-by-row inside Spark executors.  Useful when built-in functions
-    can't express the logic, but slower than native expressions.
-    """
-    if risk_score is None:
+def classify_health(battery_health_level: Optional[float]) -> str:
+    """Bucket battery state-of-health into service tiers."""
+    if battery_health_level is None:
         return "UNKNOWN"
-    if risk_score >= 0.8:
-        return "CRITICAL"
-    if risk_score >= 0.6:
-        return "HIGH"
-    if risk_score >= 0.4:
-        return "MEDIUM"
-    if risk_score >= 0.2:
-        return "LOW"
-    return "NEGLIGIBLE"
+    if battery_health_level >= 90:
+        return "EXCELLENT"
+    if battery_health_level >= 80:
+        return "GOOD"
+    if battery_health_level >= 70:
+        return "FAIR"
+    return "SERVICE_REQUIRED"
 
 
-@F.udf(returnType=StringType())
-def mask_account(account: Optional[str]) -> str:
-    """Mask all but the last 4 digits of an account number.
-
-    Spark concept: UDF for PII masking — shows how to process
-    string columns with arbitrary Python string ops.
-    """
-    if account is None or len(account) < 4:
-        return "****"
-    return "*" * (len(account) - 4) + account[-4:]
-
-
-@F.udf(returnType=DoubleType())
-def compute_net_amount(amount: Optional[float], fee: Optional[float],
-                       exchange_rate: Optional[float]) -> Optional[float]:
-    """Net amount after fee, converted at exchange rate.
-
-    Spark concept: multi-column UDF — takes several columns as
-    input and returns a derived value.
-    """
-    if amount is None:
-        return None
-    f = fee if fee is not None else 0.0
-    rate = exchange_rate if exchange_rate is not None else 1.0
-    return round((amount - f) * rate, 2)
-
-
-@F.udf(returnType=IntegerType())
-def ip_to_int(ip: Optional[str]) -> Optional[int]:
-    """Convert dotted IPv4 string to a 32-bit integer.
-
-    Spark concept: UDF for type conversion — useful for range joins
-    or geo-IP lookups against integer IP ranges.
-    """
-    if ip is None:
-        return None
-    try:
-        parts = ip.split(".")
-        return (int(parts[0]) << 24) + (int(parts[1]) << 16) + \
-               (int(parts[2]) << 8) + int(parts[3])
-    except (IndexError, ValueError):
-        return None
-
-
-@F.udf(returnType=DoubleType())
-def log_amount(amount: Optional[float]) -> Optional[float]:
-    """Natural log of amount (for distribution normalization).
-
-    Spark concept: math UDF — when built-in F.log() isn't enough
-    (e.g. you need custom handling of zero/negative).
-    """
-    if amount is None or amount <= 0:
-        return None
-    return round(math.log(amount), 4)
+def _is_true(condition) -> F.Column:
+    """Null-safe boolean: a null comparison counts as False."""
+    return F.coalesce(condition, F.lit(False))
 
 
 # ─────────────────────────────────────────────────────────────
-# 2. Transform functions  —  DataFrame → DataFrame
+# Transforms — DataFrame → DataFrame
 # ─────────────────────────────────────────────────────────────
+
+def add_null_handling(df: DataFrame) -> DataFrame:
+    """T1: defaults for vehicle-context fields every event should carry."""
+    return (
+        df
+        .withColumn("model_safe", F.coalesce(F.col("model"), F.lit("MODEL_UNKNOWN")))
+        .withColumn("software_version_safe",
+                    F.coalesce(F.col("software_version"), F.lit("0.0.0")))
+        .withColumn("power_state_safe",
+                    F.coalesce(F.col("power_state"), F.lit("POWER_STATE_UNKNOWN")))
+        .na.fill({"odometer_km": 0.0})
+    )
+
 
 def add_time_dimensions(df: DataFrame) -> DataFrame:
-    """Extract date parts from the transaction timestamp.
-
-    Spark concepts demonstrated:
-      - to_date / to_timestamp — string → date/timestamp casting
-      - year, month, dayofweek, hour — temporal extraction
-      - date_format — custom date string formatting
-      - when/otherwise — conditional column (is_weekend)
-    """
+    """T2: calendar parts of the vehicle-recorded event_time (UTC)."""
+    ts = F.col("event_time")
     return (
         df
-        .withColumn("transaction_date", F.to_date(F.col("timestamp")))
-        .withColumn("txn_year", F.year("timestamp"))
-        .withColumn("txn_month", F.month("timestamp"))
-        .withColumn("txn_day", F.dayofmonth("timestamp"))
-        .withColumn("txn_hour", F.hour("timestamp"))
-        .withColumn("txn_dayofweek", F.dayofweek("timestamp"))
-        .withColumn(
-            "is_weekend",
-            F.when(F.dayofweek("timestamp").isin(1, 7), True).otherwise(False),
-        )
-        .withColumn("txn_quarter", F.quarter("timestamp"))
-        .withColumn("date_str", F.date_format("timestamp", "yyyy-MM-dd"))
+        .withColumn("event_date", F.to_date(ts))
+        .withColumn("event_year", F.year(ts))
+        .withColumn("event_month", F.month(ts))
+        .withColumn("event_day", F.dayofmonth(ts))
+        .withColumn("event_hour", F.hour(ts))
+        .withColumn("event_dayofweek", F.dayofweek(ts))
+        .withColumn("is_weekend", F.dayofweek(ts).isin(1, 7))
+        .withColumn("event_quarter", F.quarter(ts))
+        .withColumn("date_str", F.date_format(ts, "yyyy-MM-dd"))
     )
 
 
-def add_amount_features(df: DataFrame) -> DataFrame:
-    """Derive amount-based features using built-in math + when/otherwise.
-
-    Spark concepts demonstrated:
-      - when/otherwise — multi-branch conditional (amount_bucket)
-      - Arithmetic expressions — col * col, col - col
-      - F.round — decimal precision control
-      - F.log — built-in log (compare to UDF version)
-      - F.abs — absolute value
-      - F.greatest / F.least — row-level min/max across columns
-    """
+def add_battery_features(df: DataFrame) -> DataFrame:
+    """T3: derived battery metrics. Null when the source fields are absent."""
+    soc = F.col("charge_percent")
     return (
         df
-        # Bucket by amount range
         .withColumn(
-            "amount_bucket",
-            F.when(F.col("amount") < 100, "MICRO")
-            .when(F.col("amount") < 1_000, "SMALL")
-            .when(F.col("amount") < 10_000, "MEDIUM")
-            .when(F.col("amount") < 100_000, "LARGE")
-            .otherwise("WHALE"),
+            "soc_bucket",
+            F.when(soc.isNull(), "UNKNOWN")
+            .when(soc < 10, "CRITICAL")
+            .when(soc < 20, "LOW")
+            .when(soc < 80, "NORMAL")
+            .otherwise("HIGH"),
         )
-        # Net amount after fee
         .withColumn(
-            "net_amount",
-            F.round(F.col("amount") - F.coalesce(F.col("fee"), F.lit(0.0)), 2),
+            "energy_pct",
+            F.when(F.col("capacity_kwhr") > 0,
+                   F.round(F.col("kwhr") / F.col("capacity_kwhr") * 100, 2)),
         )
-        # Fee as percentage of amount
+        .withColumn("cell_temp_spread",
+                    F.round(F.col("max_cell_temp") - F.col("min_cell_temp"), 2))
+        .withColumn("degradation_pct", F.round(100 - F.col("battery_health_level"), 2))
         .withColumn(
-            "fee_pct",
-            F.when(F.col("amount") > 0,
-                   F.round(F.col("fee") / F.col("amount") * 100, 4))
-            .otherwise(F.lit(None)),
-        )
-        # Amount in USD equivalent (amount * exchange_rate)
-        .withColumn(
-            "amount_usd",
-            F.round(
-                F.col("amount") * F.coalesce(F.col("exchange_rate"), F.lit(1.0)), 2
-            ),
-        )
-        # Log-scaled amount for distribution analysis
-        .withColumn(
-            "log_amount",
-            F.when(F.col("amount") > 0, F.round(F.log(F.col("amount")), 4))
-            .otherwise(F.lit(None)),
+            "km_per_percent",
+            F.when(soc > 0, F.round(F.col("remaining_range") / soc, 3)),
         )
     )
 
 
-def add_risk_features(df: DataFrame) -> DataFrame:
-    """Compute risk-related derived columns.
-
-    Spark concepts demonstrated:
-      - UDF invocation — classify_risk(col) used as a column expression
-      - F.when chained — multi-level conditions
-      - Boolean column creation — direct comparison → bool
-      - F.coalesce — null-safe fallback
-    """
+def add_health_features(df: DataFrame) -> DataFrame:
+    """T4: service and safety flags consumed by warranty and service systems."""
+    thermal = (
+        _is_true(F.col("max_cell_temp") >= THERMAL_MAX_CELL_TEMP_C)
+        | _is_true(F.col("cell_temp_spread") >= THERMAL_CELL_SPREAD_C)
+    )
+    fault = (
+        _is_true(F.col("warning_state") == "WARNING_ON")
+        | _is_true(F.col("charge_state").isin(FAULT_CHARGE_STATES))
+        | _is_true(F.col("update_state").isin(FAILED_UPDATE_STATES))
+    )
     return (
         df
-        # Risk tier via UDF (see classify_risk above)
-        .withColumn("risk_tier", classify_risk(F.col("risk_score")))
-        # Numeric risk level for ordering
+        .withColumn("health_tier", classify_health(F.col("battery_health_level")))
+        .withColumn("thermal_alert", thermal)
+        .withColumn("is_fault", fault)
         .withColumn(
-            "risk_level",
-            F.when(F.col("risk_score") >= 0.8, 5)
-            .when(F.col("risk_score") >= 0.6, 4)
-            .when(F.col("risk_score") >= 0.4, 3)
-            .when(F.col("risk_score") >= 0.2, 2)
-            .when(F.col("risk_score") >= 0.0, 1)
+            "needs_service",
+            _is_true(F.col("battery_health_level") < SERVICE_HEALTH_THRESHOLD)
+            | F.col("thermal_alert")
+            | F.col("is_fault"),
+        )
+        .withColumn(
+            "severity_level",
+            F.when(F.col("thermal_alert"), 3)
+            .when(F.col("is_fault"), 2)
+            .when(F.col("needs_service"), 1)
             .otherwise(0),
         )
-        # Composite flag: high risk OR already flagged OR large amount
-        .withColumn(
-            "needs_review",
-            (
-                (F.col("risk_score") >= 0.7)
-                | (F.col("is_flagged") == True)
-                | (F.col("amount") >= 100_000)
-            ),
-        )
     )
 
 
-def add_geo_features(df: DataFrame) -> DataFrame:
-    """Derive geography-based columns.
-
-    Spark concepts demonstrated:
-      - String comparison — col == col (cross-border detection)
-      - F.concat_ws — join multiple columns with separator
-      - F.upper, F.lower, F.trim — string transformations
-      - F.when with compound conditions — AND / OR logic
-    """
+def add_location_features(df: DataFrame) -> DataFrame:
+    """T5 (privacy): coarsen GPS to 2 dp (~1 km) and drop precise coordinates."""
     return (
         df
-        # Is this a cross-border transaction?
-        .withColumn(
-            "is_cross_border",
-            F.col("sender_country") != F.col("receiver_country"),
-        )
-        # Corridor string: "US→GB"
-        .withColumn(
-            "corridor",
-            F.concat_ws(
-                "→",
-                F.upper(F.col("sender_country")),
-                F.upper(F.col("receiver_country")),
-            ),
-        )
-        # Same-bank transfer detection
-        .withColumn(
-            "is_intra_bank",
-            F.col("sender_bank_code") == F.col("receiver_bank_code"),
-        )
+        .withColumn("lat_coarse", F.round(F.col("latitude"), 2))
+        .withColumn("lon_coarse", F.round(F.col("longitude"), 2))
+        .drop("latitude", "longitude")
     )
 
 
 def add_anonymized_columns(df: DataFrame) -> DataFrame:
-    """Hash/mask PII columns for analytics-safe output.
-
-    Spark concepts demonstrated:
-      - F.sha2 — built-in SHA-256 hashing (no UDF needed)
-      - UDF for masking — mask_account applied per-row
-      - F.regexp_replace — regex-based string transformation
-      - Column aliasing with .alias()
-    """
+    """T6 (privacy): replace the VIN with a stable pseudonym; keep only the WMI."""
     return (
         df
-        # Hash sender/receiver names → non-reversible pseudonyms
-        .withColumn("sender_hash", F.sha2(F.col("sender_name"), 256))
-        .withColumn("receiver_hash", F.sha2(F.col("receiver_name"), 256))
-        # Mask account numbers (UDF)
-        .withColumn("sender_account_masked", mask_account(F.col("sender_account")))
-        .withColumn("receiver_account_masked", mask_account(F.col("receiver_account")))
-        # Anonymize IP: replace last octet with "xxx"
-        .withColumn(
-            "ip_anonymized",
-            F.regexp_replace(F.col("ip_address"), r"\.\d+$", ".xxx"),
-        )
+        .withColumn("vin_hash", F.sha2(F.col("vin"), 256))
+        .withColumn("vin_wmi", F.substring(F.col("vin"), 1, 3))
+        .drop("vin")
     )
 
 
-def add_session_features(df: DataFrame) -> DataFrame:
-    """Session and channel analysis columns.
-
-    Spark concepts demonstrated:
-      - F.length — string length
-      - F.substring — extract part of a string
-      - F.monotonically_increasing_id — unique row ID (not sequential!)
-      - F.lit — add a constant column
-    """
+def add_event_features(df: DataFrame) -> DataFrame:
+    """T7: row identity and software version parts."""
+    version_parts = F.split(F.col("software_version_safe"), r"\.")
     return (
         df
-        # First 8 chars of device fingerprint as short ID
-        .withColumn("device_short_id", F.substring(F.col("device_fingerprint"), 1, 8))
-        # Session prefix (first segment of UUID)
-        .withColumn(
-            "session_prefix",
-            F.substring(F.col("session_id"), 1, 8),
-        )
-        # Memo length — useful for text analysis
-        .withColumn("memo_length", F.length(F.col("memo")))
-        # Has memo flag
-        .withColumn(
-            "has_memo",
-            (F.col("memo").isNotNull()) & (F.length(F.col("memo")) > 0),
-        )
-        # Assign a unique row ID using sha2 hash of transaction_id
-        .withColumn("row_id", F.sha2(F.col("transaction_id"), 256))
+        .withColumn("row_id", F.sha2(F.col("event_id"), 256))
+        .withColumn("sw_major", version_parts.getItem(0).cast("int"))
+        .withColumn("sw_minor", version_parts.getItem(1).cast("int"))
     )
 
-
-def add_null_handling(df: DataFrame) -> DataFrame:
-    """Demonstrate null-safe operations.
-
-    Spark concepts demonstrated:
-      - F.coalesce — first non-null among columns
-      - na.fill — replace nulls with defaults (dict of col→value)
-      - F.when(col.isNull(), ...) — explicit null check
-      - F.nanvl — replace NaN with a value (for DoubleType)
-    """
-    return (
-        df
-        .withColumn(
-            "currency_safe",
-            F.coalesce(F.col("currency"), F.lit("USD")),
-        )
-        .withColumn(
-            "risk_score_safe",
-            F.coalesce(F.col("risk_score"), F.lit(0.0)),
-        )
-        .withColumn(
-            "memo_clean",
-            F.when(F.col("memo").isNull(), F.lit("(no memo)"))
-            .otherwise(F.trim(F.col("memo"))),
-        )
-        .na.fill({
-            "fee": 0.0,
-            "exchange_rate": 1.0,
-            "sender_country": "XX",
-            "receiver_country": "XX",
-        })
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-# 3. Pipeline combinator — apply all transforms in order
-# ─────────────────────────────────────────────────────────────
 
 def apply_all_transforms(df: DataFrame) -> DataFrame:
-    """Chain every enrichment transform.  Order matters where
-    downstream columns depend on upstream (e.g. amount_bucket
-    must exist before risk features reference amount).
-    """
+    """Chain every enrichment transform. T4 depends on T3 (cell_temp_spread)."""
     return (
         df
         .transform(add_null_handling)
         .transform(add_time_dimensions)
-        .transform(add_amount_features)
-        .transform(add_risk_features)
-        .transform(add_geo_features)
+        .transform(add_battery_features)
+        .transform(add_health_features)
+        .transform(add_location_features)
         .transform(add_anonymized_columns)
-        .transform(add_session_features)
+        .transform(add_event_features)
     )

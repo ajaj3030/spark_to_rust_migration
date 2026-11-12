@@ -1,9 +1,12 @@
 """
 Spark Structured Streaming job: Kafka → Delta Lake.
 
-Reads financial transaction JSON from Kafka, applies a rich set of inline
-transformations (UDFs, conditionals, hashing, null-handling, geo-features,
-risk classification, PII masking), and writes to a Delta table.
+Reads vehicle telemetry JSON from Kafka (keyed by VIN), applies the
+enrichment chain in transforms.py (battery metrics, health/fault flags,
+GPS coarsening, VIN pseudonymisation) and appends to a Delta table.
+
+This is the job that has already been ported to Rust (`rust-pipeline
+stream`); `rust-pipeline validate` checks the two outputs match.
 
 ──────────────────────────────────────────────────────────────────────
 SPARK CONCEPTS EXERCISED IN THIS PIPELINE
@@ -12,9 +15,9 @@ SPARK CONCEPTS EXERCISED IN THIS PIPELINE
   2. from_json + schema       — parse raw bytes into typed columns
   3. withColumn               — add/replace columns declaratively
   4. when / otherwise         — SQL CASE-WHEN as column expressions
-  5. UDFs (Python)            — classify_risk, mask_account, etc.
-  6. Built-in functions       — year, month, dayofweek, sha2, log,
-                                coalesce, regexp_replace, concat_ws
+  5. UDFs (Python)            — classify_health
+  6. Built-in functions       — year, month, dayofweek, sha2, round,
+                                coalesce, split, isin
   7. Null handling            — coalesce, na.fill, isNull checks
   8. .transform()             — composable DataFrame → DataFrame chains
   9. Delta Lake sink          — append with merge-schema + partitioning
@@ -38,8 +41,9 @@ import yaml
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json
 from pyspark.sql.types import (
-    BooleanType,
     DoubleType,
+    IntegerType,
+    LongType,
     StringType,
     StructField,
     StructType,
@@ -75,36 +79,40 @@ except Exception as exc:
 _last_stage_id = -1
 _spark_app_id = None
 
-# ── Transaction JSON schema ───────────────────────────────────
+# ── Telemetry JSON schema ─────────────────────────────────────
 
-TRANSACTION_SCHEMA = StructType([
-    StructField("transaction_id", StringType(), False),
-    StructField("timestamp", StringType(), False),
-    StructField("sender_account_id", StringType(), True),
-    StructField("receiver_account_id", StringType(), True),
-    StructField("sender_account", StringType(), True),
-    StructField("receiver_account", StringType(), True),
-    StructField("amount", DoubleType(), True),
-    StructField("currency", StringType(), True),
-    StructField("transaction_type", StringType(), True),
-    StructField("status", StringType(), True),
-    StructField("sender_name", StringType(), True),
-    StructField("receiver_name", StringType(), True),
-    StructField("sender_bank_code", StringType(), True),
-    StructField("receiver_bank_code", StringType(), True),
-    StructField("sender_country", StringType(), True),
-    StructField("receiver_country", StringType(), True),
-    StructField("fee", DoubleType(), True),
-    StructField("exchange_rate", DoubleType(), True),
-    StructField("reference_id", StringType(), True),
-    StructField("memo", StringType(), True),
-    StructField("risk_score", DoubleType(), True),
-    StructField("is_flagged", BooleanType(), True),
-    StructField("category", StringType(), True),
-    StructField("channel", StringType(), True),
-    StructField("ip_address", StringType(), True),
-    StructField("device_fingerprint", StringType(), True),
-    StructField("session_id", StringType(), True),
+TELEMETRY_SCHEMA = StructType([
+    StructField("event_id", StringType(), False),
+    StructField("vin", StringType(), False),
+    StructField("event_type", StringType(), False),
+    StructField("event_time", StringType(), False),
+    StructField("sequence_number", LongType(), False),
+    StructField("model", StringType(), True),
+    StructField("model_variant", StringType(), True),
+    StructField("software_version", StringType(), True),
+    StructField("power_state", StringType(), True),
+    StructField("latitude", DoubleType(), True),
+    StructField("longitude", DoubleType(), True),
+    StructField("odometer_km", DoubleType(), True),
+    StructField("charge_percent", DoubleType(), True),
+    StructField("remaining_range", DoubleType(), True),
+    StructField("kwhr", DoubleType(), True),
+    StructField("capacity_kwhr", DoubleType(), True),
+    StructField("battery_health_level", DoubleType(), True),
+    StructField("max_cell_temp", DoubleType(), True),
+    StructField("min_cell_temp", DoubleType(), True),
+    StructField("preconditioning_status", StringType(), True),
+    StructField("battery_pack_type", StringType(), True),
+    StructField("charge_state", StringType(), True),
+    StructField("charge_session_id", StringType(), True),
+    StructField("charging_power_kw", DoubleType(), True),
+    StructField("energy_added_kwh", DoubleType(), True),
+    StructField("ecu", StringType(), True),
+    StructField("dtc_code", StringType(), True),
+    StructField("warning_state", StringType(), True),
+    StructField("update_state", StringType(), True),
+    StructField("target_software_version", StringType(), True),
+    StructField("update_progress_percent", IntegerType(), True),
 ])
 
 
@@ -125,6 +133,8 @@ def create_spark_session(cfg: dict, local: bool) -> SparkSession:
         )
         .config("spark.sql.shuffle.partitions", cfg["spark"]["shuffle_partitions"])
         .config("spark.sql.streaming.schemaInference", "false")
+        # event_time is UTC; derive calendar parts in UTC regardless of host TZ
+        .config("spark.sql.session.timeZone", "UTC")
     )
 
     if local:
@@ -141,9 +151,9 @@ def run_streaming_job(cfg: dict, local: bool):
     The transformation chain uses .transform() to compose reusable
     DataFrame→DataFrame functions from the transforms module:
 
-        raw → parse → null_handling → time_dims → amount_features
-            → risk_features → geo_features → anonymize → session
-            → write to Delta
+        raw → parse → null_handling → time_dims → battery_features
+            → health_features → location (coarsen GPS) → anonymize VIN
+            → event_features → drop kafka_key (VIN) → write to Delta
     """
     spark = create_spark_session(cfg, local)
     spark.sparkContext.setLogLevel("WARN")
@@ -194,7 +204,7 @@ def run_streaming_job(cfg: dict, local: bool):
         raw_df
         .select(
             col("key").cast("string").alias("kafka_key"),
-            from_json(col("value").cast("string"), TRANSACTION_SCHEMA).alias("data"),
+            from_json(col("value").cast("string"), TELEMETRY_SCHEMA).alias("data"),
             col("topic"),
             col("partition").alias("kafka_partition"),
             col("offset").alias("kafka_offset"),
@@ -220,7 +230,8 @@ def run_streaming_job(cfg: dict, local: bool):
 
         # ── Transform phase ───────────────────────────────────
         t0 = _time.perf_counter()
-        enriched = batch_df.transform(apply_all_transforms)
+        # kafka_key is the VIN — drop it so the table holds no raw identifiers
+        enriched = batch_df.transform(apply_all_transforms).drop("kafka_key")
         # Force materialisation so transform time is real
         row_count = enriched.count()
         t_transform = (_time.perf_counter() - t0) * 1000  # ms
@@ -232,7 +243,7 @@ def run_streaming_job(cfg: dict, local: bool):
             .format("delta")
             .mode("append")
             .option("mergeSchema", "true")
-            .partitionBy("txn_year", "txn_month", "currency")
+            .partitionBy("event_year", "event_month", "event_type")
             .save(delta_path)
         )
         t_write = (_time.perf_counter() - t1) * 1000  # ms

@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # ---------- Kafka Infrastructure ----------
   zookeeper:
@@ -63,19 +61,19 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        echo 'Creating Kafka topic: financial_transactions'
+        echo 'Creating Kafka topic: vehicle_telemetry'
         kafka-topics --create --if-not-exists \
           --bootstrap-server kafka:29092 \
-          --topic financial_transactions \
+          --topic vehicle_telemetry \
           --partitions 8 \
           --replication-factor 1 \
           --config retention.ms=604800000 \
           --config max.message.bytes=10485760
 
-        echo 'Creating Kafka topic: account_updates'
+        echo 'Creating Kafka topic: vehicle_state_updates'
         kafka-topics --create --if-not-exists \
           --bootstrap-server kafka:29092 \
-          --topic account_updates \
+          --topic vehicle_state_updates \
           --partitions 8 \
           --replication-factor 1 \
           --config retention.ms=604800000 \
@@ -83,12 +81,12 @@ services:
           --config cleanup.policy=compact
 
         echo 'Enforcing 7-day retention on all topics (survives restarts)...'
-        kafka-configs --bootstrap-server kafka:29092 --entity-type topics --entity-name financial_transactions --alter --add-config retention.ms=604800000,max.message.bytes=10485760
-        kafka-configs --bootstrap-server kafka:29092 --entity-type topics --entity-name account_updates --alter --add-config retention.ms=604800000,max.message.bytes=10485760,cleanup.policy=compact
+        kafka-configs --bootstrap-server kafka:29092 --entity-type topics --entity-name vehicle_telemetry --alter --add-config retention.ms=604800000,max.message.bytes=10485760
+        kafka-configs --bootstrap-server kafka:29092 --entity-type topics --entity-name vehicle_state_updates --alter --add-config retention.ms=604800000,max.message.bytes=10485760,cleanup.policy=compact
 
         echo 'Topics created/configured successfully.'
-        kafka-topics --describe --bootstrap-server kafka:29092 --topic financial_transactions
-        kafka-topics --describe --bootstrap-server kafka:29092 --topic account_updates
+        kafka-topics --describe --bootstrap-server kafka:29092 --topic vehicle_telemetry
+        kafka-topics --describe --bootstrap-server kafka:29092 --topic vehicle_state_updates
 
   # ---------- Spark ----------
   spark-master:
@@ -96,7 +94,8 @@ services:
     container_name: spark-master
     restart: unless-stopped
     user: root
-    command: /opt/spark/sbin/start-master.sh
+    # The jobs import PyYAML, which the base image lacks
+    command: ["bash", "-c", "pip install -q pyyaml && /opt/spark/sbin/start-master.sh"]
     environment:
       SPARK_MASTER_HOST: spark-master
       SPARK_MASTER_PORT: 7077
@@ -121,7 +120,7 @@ services:
     container_name: spark-worker
     restart: unless-stopped
     user: root
-    command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
+    command: ["bash", "-c", "pip install -q pyyaml && /opt/spark/sbin/start-worker.sh spark://spark-master:7077"]
     depends_on:
       - spark-master
     environment:
@@ -142,7 +141,7 @@ services:
     container_name: spark-worker-2
     restart: unless-stopped
     user: root
-    command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
+    command: ["bash", "-c", "pip install -q pyyaml && /opt/spark/sbin/start-worker.sh spark://spark-master:7077"]
     depends_on:
       - spark-master
     environment:

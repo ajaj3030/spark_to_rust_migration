@@ -1,34 +1,22 @@
-use crate::schema::TransactionInput;
+use crate::schema::TelemetryInput;
 
 pub struct NullHandled {
-    pub currency_safe: String,
-    pub risk_score_safe: f64,
-    pub memo_clean: String,
-    pub fee: f64,
-    pub exchange_rate: f64,
-    pub sender_country: String,
-    pub receiver_country: String,
+    pub model_safe: String,
+    pub software_version_safe: String,
+    pub power_state_safe: String,
+    pub odometer_km: f64,
 }
 
 /// Spark parity: add_null_handling
-/// - currency_safe ← coalesce(currency, "USD")
-/// - risk_score_safe ← coalesce(risk_score, 0.0)
-/// - memo_clean ← isNull(memo) ? "(no memo)" : trim(memo)
-/// - fee ← coalesce(fee, 0.0)
-/// - exchange_rate ← coalesce(exchange_rate, 1.0)
-/// - sender_country ← coalesce(sender_country, "XX")
-/// - receiver_country ← coalesce(receiver_country, "XX")
-pub fn apply(input: &TransactionInput) -> NullHandled {
+/// - model_safe            ← coalesce(model, "MODEL_UNKNOWN")
+/// - software_version_safe ← coalesce(software_version, "0.0.0")
+/// - power_state_safe      ← coalesce(power_state, "POWER_STATE_UNKNOWN")
+/// - odometer_km           ← na.fill(0.0)
+pub fn apply(input: &TelemetryInput) -> NullHandled {
     NullHandled {
-        currency_safe: input.currency.clone().unwrap_or_else(|| "USD".into()),
-        risk_score_safe: input.risk_score.unwrap_or(0.0),
-        memo_clean: match &input.memo {
-            Some(m) if !m.trim().is_empty() => m.trim().to_string(),
-            _ => "(no memo)".into(),
-        },
-        fee: input.fee.unwrap_or(0.0),
-        exchange_rate: input.exchange_rate.unwrap_or(1.0),
-        sender_country: input.sender_country.clone().unwrap_or_else(|| "XX".into()),
-        receiver_country: input.receiver_country.clone().unwrap_or_else(|| "XX".into()),
+        model_safe: input.model.clone().unwrap_or_else(|| "MODEL_UNKNOWN".into()),
+        software_version_safe: input.software_version.clone().unwrap_or_else(|| "0.0.0".into()),
+        power_state_safe: input.power_state.clone().unwrap_or_else(|| "POWER_STATE_UNKNOWN".into()),
+        odometer_km: input.odometer_km.unwrap_or(0.0),
     }
 }

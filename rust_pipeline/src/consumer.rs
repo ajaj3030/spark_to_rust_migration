@@ -1,7 +1,7 @@
 use crate::checkpoint::Checkpoint;
 use crate::config::AppConfig;
 use crate::metrics::MetricsBridge;
-use crate::schema::{self, KafkaMeta, TransactionInput, TransactionOutput};
+use crate::schema::{self, KafkaMeta, TelemetryInput, TelemetryOutput};
 use crate::transforms;
 use crate::writer;
 
@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 struct OwnedMessage {
-    key: Option<String>,
     payload: Vec<u8>,
     topic: String,
     partition: i32,
@@ -32,9 +31,9 @@ pub async fn run_streaming_pipeline(cfg: &AppConfig) -> Result<()> {
     let ckpt_path = cfg.rust_checkpoint_path();
     let metrics_path = cfg.rust_metrics_path();
     let partition_cols = vec![
-        "txn_year".to_string(),
-        "txn_month".to_string(),
-        "currency".to_string(),
+        "event_year".to_string(),
+        "event_month".to_string(),
+        "event_type".to_string(),
     ];
 
     // Create consumer
@@ -81,12 +80,11 @@ pub async fn run_streaming_pipeline(cfg: &AppConfig) -> Result<()> {
 
         // Deserialize + transform (parallel via rayon)
         let t_transform_start = Instant::now();
-        let records: Vec<TransactionOutput> = messages
+        let records: Vec<TelemetryOutput> = messages
             .par_iter()
             .filter_map(|msg| {
-                let input: TransactionInput = serde_json::from_slice(&msg.payload).ok()?;
+                let input: TelemetryInput = serde_json::from_slice(&msg.payload).ok()?;
                 let meta = KafkaMeta {
-                    key: msg.key.clone(),
                     topic: msg.topic.clone(),
                     partition: msg.partition,
                     offset: msg.offset,
@@ -97,13 +95,21 @@ pub async fn run_streaming_pipeline(cfg: &AppConfig) -> Result<()> {
             .collect();
         let t_transform = t_transform_start.elapsed();
 
+        let rejected = row_count - records.len();
+        if rejected > 0 {
+            tracing::warn!(
+                "Batch {}: {} of {} messages failed to parse and were skipped",
+                batch_id, rejected, row_count,
+            );
+        }
+
         if records.is_empty() {
             continue;
         }
 
         // Build Arrow batch and write to Delta
         let t_write_start = Instant::now();
-        let arrow_batch = schema::build_transaction_batch(&records)?;
+        let arrow_batch = schema::build_telemetry_batch(&records)?;
         writer::write_batch(&delta_path, arrow_batch, &partition_cols).await?;
         let t_write = t_write_start.elapsed();
 
@@ -154,7 +160,6 @@ async fn collect_batch(
             Ok(Ok(msg)) => {
                 if let Some(payload) = msg.payload() {
                     messages.push(OwnedMessage {
-                        key: msg.key().map(|k| String::from_utf8_lossy(k).into_owned()),
                         payload: payload.to_vec(),
                         topic: msg.topic().to_string(),
                         partition: msg.partition(),

@@ -1,31 +1,45 @@
 """
-High-throughput financial transaction data generator.
+High-throughput vehicle telemetry generator.
 
-Produces synthetic transaction records and publishes them to Kafka.
-Designed to push ~5 GB of data per run using multiple producer threads.
+Simulates a fleet of vehicles publishing vehicle-to-cloud telemetry to Kafka.
+For every telemetry event a latest-state snapshot is also published so the
+vehicle_state Delta table can be upserted (MERGE) in near-real-time.
 
-Uses a fixed pool of 2048 accounts.  Each transaction picks a random
-sender and receiver from the pool.  For every transaction, an account-
-update event is also emitted to a separate Kafka topic so the accounts
-Delta table can be upserted (MERGE) in near-real-time.
+Ordering: vehicles are sharded across producer threads (vehicle i belongs to
+thread i % num_threads), so every VIN is written by exactly one producer and
+Kafka's per-key ordering holds. Each event also carries a per-VIN
+sequence_number so consumers can enforce ordering and idempotency themselves.
 """
 
-import hashlib
 import json
 import logging
 import random
-import sys
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import List, Optional
 
 import orjson
-from faker import Faker
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
+
+from .schemas import (
+    BATTERY_PRECON_STATUSES,
+    CHARGE_STATES_WEIGHTED,
+    DTC_CODES,
+    ECUS,
+    EVENT_TYPES_WEIGHTED,
+    KM_PER_PERCENT,
+    POWER_STATES,
+    SOFTWARE_VERSIONS,
+    TELEMETRY_FIELDS,
+    UPDATE_STATES_WEIGHTED,
+    Vehicle,
+    build_fleet,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,140 +47,184 @@ logger = logging.getLogger(__name__)
 _METRICS_DIR = Path(__file__).resolve().parent.parent / "logs"
 _GEN_JSON_PATH = _METRICS_DIR / "generator_metrics.json"
 
-from .schemas import (
-    ACCOUNT_POOL,
-    ACCOUNT_STATUSES,
-    CATEGORIES,
-    CHANNELS,
-    CURRENCIES,
-    KYC_LEVELS,
-    STATUSES,
-    TRANSACTION_TYPES,
-    AccountInfo,
-)
-
-logger = logging.getLogger(__name__)
-
-# Thread-local Faker instances to avoid contention
-_thread_local = threading.local()
+THERMAL_SPIKE_PROBABILITY = 0.02
 
 
-def _get_faker() -> Faker:
-    """Return a per-thread Faker instance (thread-safe)."""
-    if not hasattr(_thread_local, "faker"):
-        _thread_local.faker = Faker()
-        Faker.seed(threading.get_ident())
-    return _thread_local.faker
+def _weighted_choice(rng: random.Random, weighted: list) -> str:
+    values, weights = zip(*weighted)
+    return rng.choices(values, weights=weights)[0]
 
 
-def generate_record() -> dict:
-    """Generate a single financial transaction record (~500 bytes JSON).
+def _iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
-    Picks sender and receiver from the 2048-account pool so account IDs
-    are consistent and can be correlated with the accounts table.
-    """
-    fake = _get_faker()
-    now = datetime.now(timezone.utc)
-    ts = now - timedelta(seconds=random.randint(0, 86400))
 
-    # Pick two distinct accounts from the pool
-    sender_acct, receiver_acct = random.sample(ACCOUNT_POOL, 2)
+def _next_software_version(current: str) -> str:
+    idx = SOFTWARE_VERSIONS.index(current) if current in SOFTWARE_VERSIONS else 0
+    return SOFTWARE_VERSIONS[min(idx + 1, len(SOFTWARE_VERSIONS) - 1)]
 
-    amount = round(random.uniform(0.01, 999999.99), 2)
-    fee = round(amount * random.uniform(0.0001, 0.03), 2)
 
-    txn_id = str(uuid.uuid4())
-    session_bytes = uuid.uuid4().bytes
-    device_fp = hashlib.sha256(session_bytes).hexdigest()
+# ── Event builders: each fills one group of fields ────────────
 
+def _battery_fields(v: Vehicle, rng: random.Random) -> dict:
+    v.charge_percent = round(min(100.0, max(1.0, v.charge_percent - rng.uniform(0, 1.5))), 1)
+    min_temp = round(rng.uniform(15.0, 35.0), 1)
+    spread = rng.uniform(25.0, 30.0) if rng.random() < THERMAL_SPIKE_PROBABILITY else rng.uniform(0.5, 6.0)
     return {
-        "transaction_id": txn_id,
-        "timestamp": ts.isoformat(),
-        "sender_account_id": sender_acct.account_id,
-        "receiver_account_id": receiver_acct.account_id,
-        "sender_account": sender_acct.account_number,
-        "receiver_account": receiver_acct.account_number,
-        "amount": amount,
-        "currency": random.choice(CURRENCIES),
-        "transaction_type": random.choice(TRANSACTION_TYPES),
-        "status": random.choice(STATUSES),
-        "sender_name": sender_acct.holder_name,
-        "receiver_name": receiver_acct.holder_name,
-        "sender_bank_code": sender_acct.bank_code,
-        "receiver_bank_code": receiver_acct.bank_code,
-        "sender_country": sender_acct.country,
-        "receiver_country": receiver_acct.country,
-        "fee": fee,
-        "exchange_rate": round(random.uniform(0.5, 1.5), 6),
-        "reference_id": f"REF-{fake.numerify('##########')}",
-        "memo": fake.text(max_nb_chars=120),
-        "risk_score": round(random.uniform(0.0, 1.0), 4),
-        "is_flagged": random.random() < 0.05,
-        "category": random.choice(CATEGORIES),
-        "channel": random.choice(CHANNELS),
-        "ip_address": fake.ipv4(),
-        "device_fingerprint": device_fp,
-        "session_id": str(uuid.uuid4()),
+        "charge_percent": v.charge_percent,
+        "remaining_range": round(v.charge_percent * KM_PER_PERCENT[v.model], 1),
+        "kwhr": round(v.capacity_kwhr * v.charge_percent / 100.0, 2),
+        "capacity_kwhr": v.capacity_kwhr,
+        "battery_health_level": v.battery_health_level,
+        "max_cell_temp": round(min_temp + spread, 1),
+        "min_cell_temp": min_temp,
+        "preconditioning_status": rng.choice(BATTERY_PRECON_STATUSES),
+        "battery_pack_type": v.battery_pack_type,
     }
 
 
-def generate_account_update(acct: AccountInfo, amount: float,
-                            direction: str, ts: str) -> dict:
-    """Generate an account-update event for the accounts Delta table.
+def _charging_fields(v: Vehicle, rng: random.Random) -> dict:
+    state = _weighted_choice(rng, CHARGE_STATES_WEIGHTED)
+    if v.charge_session_id is None:
+        v.charge_session_id = str(uuid.uuid4())
+    charging = state == "CHARGE_STATE_CHARGING"
+    power_kw = round(rng.uniform(7.0, 300.0), 1) if charging else 0.0
+    added = round(power_kw * rng.uniform(0.01, 0.1), 2)
+    v.charge_percent = round(min(100.0, v.charge_percent + added / v.capacity_kwhr * 100), 1)
+    fields = {
+        "charge_percent": v.charge_percent,
+        "charge_state": state,
+        "charge_session_id": v.charge_session_id,
+        "charging_power_kw": power_kw,
+        "energy_added_kwh": added,
+    }
+    if state not in ("CHARGE_STATE_CHARGING", "CHARGE_STATE_CABLE_CONNECTED",
+                     "CHARGE_STATE_CHARGING_PAUSED", "CHARGE_STATE_CHARGING_SCHEDULED"):
+        v.charge_session_id = None  # session ended
+    return fields
 
-    Called for both sender (direction="SENT") and receiver ("RECEIVED")
-    on every transaction.  The Spark upsert job will MERGE these into
-    the accounts table, updating balance and counters.
-    """
-    now = datetime.now(timezone.utc).isoformat()
+
+def _diagnostic_fields(v: Vehicle, rng: random.Random) -> dict:
     return {
-        "account_id": acct.account_id,
-        "account_number": acct.account_number,
-        "holder_name": acct.holder_name,
-        "bank_code": acct.bank_code,
-        "country": acct.country,
-        "currency": acct.currency,
-        "account_type": acct.account_type,
-        "account_status": random.choice(ACCOUNT_STATUSES),
-        "balance": round(random.uniform(100, 5_000_000), 2),
-        "total_sent": round(amount if direction == "SENT" else 0.0, 2),
-        "total_received": round(amount if direction == "RECEIVED" else 0.0, 2),
-        "transaction_count": 1,
-        "risk_rating": round(random.uniform(0.0, 1.0), 4),
-        "kyc_level": random.choice(KYC_LEVELS),
-        "last_transaction_time": ts,
-        "updated_at": now,
-        "created_at": now,
+        "ecu": rng.choice(ECUS),
+        "dtc_code": rng.choice(DTC_CODES),
+        "warning_state": "WARNING_ON" if rng.random() < 0.3 else "WARNING_OFF",
     }
 
 
-class TransactionGenerator:
-    """Multi-threaded Kafka producer for financial transaction data.
+def _ota_fields(v: Vehicle, rng: random.Random) -> dict:
+    target = _next_software_version(v.software_version)
+    state = _weighted_choice(rng, UPDATE_STATES_WEIGHTED)
+    progress = 100 if state in ("UPDATE_STATE_SUCCESS", "UPDATE_SUCCESS_WITH_WARNINGS") \
+        else rng.randint(0, 99)
+    if progress == 100:
+        v.software_version = target
+    return {
+        "update_state": state,
+        "target_software_version": target,
+        "update_progress_percent": progress,
+    }
 
-    Publishes to two Kafka topics:
-      1. transaction_topic — financial transaction events
-      2. account_topic     — account update events (for Delta MERGE)
 
-    For every transaction, two account-update events are emitted:
-    one for the sender (direction=SENT) and one for the receiver
-    (direction=RECEIVED).
+EVENT_BUILDERS = {
+    "BATTERY": _battery_fields,
+    "CHARGING": _charging_fields,
+    "DIAGNOSTIC": _diagnostic_fields,
+    "OTA": _ota_fields,
+}
+
+POWER_STATE_FOR_EVENT = {
+    "CHARGING": "POWER_STATE_LIVE_CHARGE",
+    "OTA": "POWER_STATE_LIVE_UPDATE",
+}
+
+
+def _advance_vehicle(v: Vehicle, rng: random.Random, now: datetime) -> None:
+    """Move the vehicle's clock, odometer and position forward."""
+    if v.clock is None:
+        v.clock = now - timedelta(hours=24) + timedelta(seconds=rng.randint(0, 3600))
+        v.first_seen_at = _iso(v.clock)
+        # Real vehicles keep counting across reconnects; derive the starting
+        # sequence from wall-clock time so a re-run continues past earlier runs.
+        v.sequence_number = int(now.timestamp()) * 1_000_000
+    v.clock += timedelta(seconds=rng.randint(1, 120))
+    v.sequence_number += 1
+    if v.power_state == "POWER_STATE_DRIVE":
+        v.odometer_km = round(v.odometer_km + rng.uniform(0.1, 3.0), 1)
+        v.latitude += rng.uniform(-0.01, 0.01)
+        v.longitude += rng.uniform(-0.01, 0.01)
+
+
+def generate_telemetry_event(v: Vehicle, rng: random.Random, now: datetime) -> dict:
+    """Generate the next telemetry event for one vehicle."""
+    _advance_vehicle(v, rng, now)
+    event_type = _weighted_choice(rng, EVENT_TYPES_WEIGHTED)
+    v.power_state = POWER_STATE_FOR_EVENT.get(event_type, rng.choice(POWER_STATES))
+
+    event = dict.fromkeys(TELEMETRY_FIELDS)
+    event.update({
+        "event_id": str(uuid.uuid4()),
+        "vin": v.vin,
+        "event_type": event_type,
+        "event_time": _iso(v.clock),
+        "sequence_number": v.sequence_number,
+        "model": v.model,
+        "model_variant": v.model_variant,
+        "software_version": v.software_version,
+        "power_state": v.power_state,
+        "latitude": round(v.latitude, 6),
+        "longitude": round(v.longitude, 6),
+        "odometer_km": v.odometer_km,
+    })
+    event.update(EVENT_BUILDERS[event_type](v, rng))
+    return event
+
+
+def generate_state_snapshot(v: Vehicle, event: dict) -> dict:
+    """Latest-state snapshot emitted alongside each telemetry event."""
+    return {
+        "vin": v.vin,
+        "model": v.model,
+        "model_variant": v.model_variant,
+        "battery_pack_type": v.battery_pack_type,
+        "software_version": v.software_version,
+        "power_state": v.power_state,
+        "odometer_km": v.odometer_km,
+        "charge_percent": v.charge_percent,
+        "battery_health_level": v.battery_health_level,
+        "last_event_type": event["event_type"],
+        "sequence_number": v.sequence_number,
+        "event_count": 1,
+        "updated_at": event["event_time"],
+        "first_seen_at": v.first_seen_at,
+    }
+
+
+class TelemetryGenerator:
+    """Multi-threaded Kafka producer for vehicle telemetry.
+
+    Publishes to two Kafka topics, both keyed by VIN:
+      1. topic        — telemetry events
+      2. state_topic  — latest-state snapshots (for Delta MERGE)
     """
 
     def __init__(
         self,
         bootstrap_servers: str,
         topic: str,
-        account_topic: str,
+        state_topic: str,
         target_bytes: int,
         batch_size: int = 10_000,
         num_threads: int = 4,
+        num_vehicles: int = 2000,
     ):
         self.bootstrap_servers = bootstrap_servers
         self.topic = topic
-        self.account_topic = account_topic
+        self.state_topic = state_topic
         self.target_bytes = target_bytes
         self.batch_size = batch_size
         self.num_threads = num_threads
+        self.fleet = build_fleet(num_vehicles)
 
         self._bytes_sent = 0
         self._records_sent = 0
@@ -176,6 +234,7 @@ class TransactionGenerator:
         self._error_count = 0
         self._batch_times_ms: list[float] = []
         self._publish_latencies_ms: list[float] = []
+        self._run_start_time: Optional[float] = None
 
     def _create_producer(self) -> KafkaProducer:
         return KafkaProducer(
@@ -189,54 +248,28 @@ class TransactionGenerator:
             compression_type="lz4",
             max_request_size=10485760,  # 10 MB
             retries=3,
+            # One in-flight request per connection keeps per-key order intact on retry
+            max_in_flight_requests_per_connection=1,
         )
 
-    def _produce_batch(self, producer: KafkaProducer, thread_id: int) -> int:
-        """Produce one batch of records. Returns bytes sent.
-
-        For each transaction, also emits two account-update events
-        (sender + receiver) to the account_topic.
-        """
+    def _produce_batch(self, producer: KafkaProducer, vehicles: List[Vehicle],
+                       rng: random.Random) -> tuple:
+        """Produce one batch. Returns (bytes_sent, records_sent)."""
         batch_start = time.perf_counter()
         batch_bytes = 0
-        # Build a lookup from account_id → AccountInfo for fast access
-        acct_lookup = {a.account_id: a for a in ACCOUNT_POOL}
+        records = 0
+        now = datetime.now(timezone.utc)
 
         for _ in range(self.batch_size):
             if self._stop_event.is_set():
                 break
-            record = generate_record()
-            serialized = orjson.dumps(record)
-            batch_bytes += len(serialized)
-
-            # Send transaction event
-            producer.send(
-                self.topic,
-                key=record["transaction_id"],
-                value=record,
-            )
-
-            # Send account-update events for sender and receiver
-            sender_acct = acct_lookup[record["sender_account_id"]]
-            receiver_acct = acct_lookup[record["receiver_account_id"]]
-
-            sender_update = generate_account_update(
-                sender_acct, record["amount"], "SENT", record["timestamp"],
-            )
-            receiver_update = generate_account_update(
-                receiver_acct, record["amount"], "RECEIVED", record["timestamp"],
-            )
-
-            producer.send(
-                self.account_topic,
-                key=sender_update["account_id"],
-                value=sender_update,
-            )
-            producer.send(
-                self.account_topic,
-                key=receiver_update["account_id"],
-                value=receiver_update,
-            )
+            vehicle = rng.choice(vehicles)
+            event = generate_telemetry_event(vehicle, rng, now)
+            batch_bytes += len(orjson.dumps(event))
+            producer.send(self.topic, key=vehicle.vin, value=event)
+            producer.send(self.state_topic, key=vehicle.vin,
+                          value=generate_state_snapshot(vehicle, event))
+            records += 1
 
         flush_start = time.perf_counter()
         producer.flush()
@@ -247,32 +280,30 @@ class TransactionGenerator:
             self._batch_times_ms.append(batch_time_ms)
             self._publish_latencies_ms.append(publish_latency_ms)
 
-        return batch_bytes
+        return batch_bytes, records
 
     def _worker(self, thread_id: int) -> tuple:
-        """Worker thread: produces batches until global target is reached."""
+        """Worker thread: produces events for its own shard of the fleet."""
+        vehicles = self.fleet[thread_id::self.num_threads]
+        rng = random.Random(thread_id)
         producer = self._create_producer()
         thread_bytes = 0
         thread_records = 0
 
         try:
             while not self._stop_event.is_set():
-                batch_bytes = self._produce_batch(producer, thread_id)
+                batch_bytes, batch_records = self._produce_batch(producer, vehicles, rng)
                 thread_bytes += batch_bytes
-                thread_records += self.batch_size
+                thread_records += batch_records
 
                 with self._lock:
                     self._bytes_sent += batch_bytes
-                    self._records_sent += self.batch_size
+                    self._records_sent += batch_records
                     total = self._bytes_sent
-                    total_records = self._records_sent
                     self._batches_completed += 1
-                    total_batches = self._batches_completed
 
                 elapsed = time.time() - self._run_start_time
                 throughput = (total / 1e6) / elapsed if elapsed > 0 else 0
-
-                # Write metrics to JSON sidecar (read by dashboard)
                 self._write_metrics_json(
                     status="running",
                     elapsed_seconds=round(elapsed, 2),
@@ -303,30 +334,20 @@ class TransactionGenerator:
         """Execute the data generation run. Returns summary stats."""
         logger.info(
             f"Starting generation: target={self.target_bytes / 1e9:.2f} GB, "
-            f"threads={self.num_threads}, batch_size={self.batch_size}"
+            f"vehicles={len(self.fleet)}, threads={self.num_threads}, "
+            f"batch_size={self.batch_size}"
         )
         start_time = time.time()
         self._run_start_time = start_time
-        self._batches_completed = 0
-        self._error_count = 0
-        self._batch_times_ms = []
-        self._publish_latencies_ms = []
-
-        # Write initial metrics
         self._write_metrics_json(status="running")
 
         with ThreadPoolExecutor(max_workers=self.num_threads) as pool:
-            futures = {
-                pool.submit(self._worker, tid): tid
-                for tid in range(self.num_threads)
-            }
+            futures = {pool.submit(self._worker, tid): tid for tid in range(self.num_threads)}
             for future in as_completed(futures):
                 tid = futures[future]
                 try:
                     tb, tr = future.result()
-                    logger.info(
-                        f"[Thread-{tid}] Finished: {tb / 1e9:.2f} GB, {tr:,} records"
-                    )
+                    logger.info(f"[Thread-{tid}] Finished: {tb / 1e9:.2f} GB, {tr:,} records")
                 except Exception as exc:
                     logger.error(f"[Thread-{tid}] Failed: {exc}")
 
@@ -345,24 +366,19 @@ class TransactionGenerator:
             f"{self._records_sent:,} records in {elapsed:.1f}s "
             f"({throughput_mbps:.1f} MB/s)"
         )
-
-        # Final metrics
         self._write_metrics_json(
             status="completed",
             elapsed_seconds=round(elapsed, 2),
             throughput_mb_per_sec=round(throughput_mbps, 2),
         )
-
         return summary
 
     def _write_metrics_json(self, *, status: str = "running",
                             elapsed_seconds: float = 0.0,
                             throughput_mb_per_sec: float = 0.0):
         """Atomically write generator metrics to a JSON sidecar file."""
-        bt = self._batch_times_ms[-200:]  # keep last 200
+        bt = self._batch_times_ms[-200:]
         pl = self._publish_latencies_ms[-200:]
-        avg_bt = sum(bt) / len(bt) if bt else 0.0
-        avg_pl = sum(pl) / len(pl) if pl else 0.0
         data = {
             "status": status,
             "start_time": self._run_start_time,
@@ -372,8 +388,8 @@ class TransactionGenerator:
             "batches_completed": self._batches_completed,
             "elapsed_seconds": elapsed_seconds,
             "throughput_mb_per_sec": throughput_mb_per_sec,
-            "avg_batch_time_ms": round(avg_bt, 2),
-            "avg_publish_latency_ms": round(avg_pl, 2),
+            "avg_batch_time_ms": round(sum(bt) / len(bt), 2) if bt else 0.0,
+            "avg_publish_latency_ms": round(sum(pl) / len(pl), 2) if pl else 0.0,
             "batch_timings_ms": bt,
             "publish_latencies_ms": pl,
             "errors": self._error_count,
@@ -384,5 +400,5 @@ class TransactionGenerator:
             tmp = _GEN_JSON_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps(data), encoding="utf-8")
             tmp.replace(_GEN_JSON_PATH)
-        except Exception:
-            pass  # best-effort; don't crash the generator
+        except OSError as exc:
+            logger.warning(f"Could not write generator metrics sidecar: {exc}")

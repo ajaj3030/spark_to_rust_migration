@@ -4,423 +4,371 @@ use deltalake::arrow::record_batch::RecordBatch;
 use serde::Deserialize;
 use std::sync::Arc;
 
-// ── Input record (deserialized JSON from Kafka) ──────────────
+// ── Input: telemetry event (JSON from Kafka, keyed by VIN) ───
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct TransactionInput {
-    pub transaction_id: String,
-    pub timestamp: String,
-    pub sender_account_id: Option<String>,
-    pub receiver_account_id: Option<String>,
-    pub sender_account: Option<String>,
-    pub receiver_account: Option<String>,
-    pub amount: Option<f64>,
-    pub currency: Option<String>,
-    pub transaction_type: Option<String>,
-    pub status: Option<String>,
-    pub sender_name: Option<String>,
-    pub receiver_name: Option<String>,
-    pub sender_bank_code: Option<String>,
-    pub receiver_bank_code: Option<String>,
-    pub sender_country: Option<String>,
-    pub receiver_country: Option<String>,
-    pub fee: Option<f64>,
-    pub exchange_rate: Option<f64>,
-    pub reference_id: Option<String>,
-    pub memo: Option<String>,
-    pub risk_score: Option<f64>,
-    pub is_flagged: Option<bool>,
-    pub category: Option<String>,
-    pub channel: Option<String>,
-    pub ip_address: Option<String>,
-    pub device_fingerprint: Option<String>,
-    pub session_id: Option<String>,
+pub struct TelemetryInput {
+    pub event_id: String,
+    pub vin: String,
+    pub event_type: String,
+    pub event_time: String,
+    pub sequence_number: i64,
+    pub model: Option<String>,
+    pub model_variant: Option<String>,
+    pub software_version: Option<String>,
+    pub power_state: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub odometer_km: Option<f64>,
+    pub charge_percent: Option<f64>,
+    pub remaining_range: Option<f64>,
+    pub kwhr: Option<f64>,
+    pub capacity_kwhr: Option<f64>,
+    pub battery_health_level: Option<f64>,
+    pub max_cell_temp: Option<f64>,
+    pub min_cell_temp: Option<f64>,
+    pub preconditioning_status: Option<String>,
+    pub battery_pack_type: Option<String>,
+    pub charge_state: Option<String>,
+    pub charge_session_id: Option<String>,
+    pub charging_power_kw: Option<f64>,
+    pub energy_added_kwh: Option<f64>,
+    pub ecu: Option<String>,
+    pub dtc_code: Option<String>,
+    pub warning_state: Option<String>,
+    pub update_state: Option<String>,
+    pub target_software_version: Option<String>,
+    pub update_progress_percent: Option<i32>,
 }
 
-// ── Account input ────────────────────────────────────────────
+// ── Input: vehicle state snapshot ────────────────────────────
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct AccountInput {
-    pub account_id: String,
-    pub account_number: Option<String>,
-    pub holder_name: Option<String>,
-    pub bank_code: Option<String>,
-    pub country: Option<String>,
-    pub currency: Option<String>,
-    pub account_type: Option<String>,
-    pub account_status: Option<String>,
-    pub balance: Option<f64>,
-    pub total_sent: Option<f64>,
-    pub total_received: Option<f64>,
-    pub transaction_count: Option<i32>,
-    pub risk_rating: Option<f64>,
-    pub kyc_level: Option<String>,
-    pub last_transaction_time: Option<String>,
+pub struct VehicleStateInput {
+    pub vin: String,
+    pub model: Option<String>,
+    pub model_variant: Option<String>,
+    pub battery_pack_type: Option<String>,
+    pub software_version: Option<String>,
+    pub power_state: Option<String>,
+    pub odometer_km: Option<f64>,
+    pub charge_percent: Option<f64>,
+    pub battery_health_level: Option<f64>,
+    pub last_event_type: Option<String>,
+    pub sequence_number: i64,
+    pub event_count: Option<i32>,
     pub updated_at: Option<String>,
-    pub created_at: Option<String>,
+    pub first_seen_at: Option<String>,
 }
 
 // ── Kafka metadata attached to each record ───────────────────
 
 #[derive(Debug, Clone)]
 pub struct KafkaMeta {
-    pub key: Option<String>,
     pub topic: String,
     pub partition: i32,
     pub offset: i64,
     pub timestamp_ms: i64,
 }
 
-// ── Fully-transformed output record ──────────────────────────
+// ── Enriched telemetry output ────────────────────────────────
+// Privacy: no vin, latitude, longitude or kafka_key (the VIN) field exists.
 
 #[derive(Debug, Clone)]
-pub struct TransactionOutput {
-    // Original (with null-fills applied to fee/exchange_rate/sender_country/receiver_country)
-    pub kafka_key: Option<String>,
-    pub transaction_id: String,
-    pub timestamp: String,
-    pub sender_account_id: Option<String>,
-    pub receiver_account_id: Option<String>,
-    pub sender_account: Option<String>,
-    pub receiver_account: Option<String>,
-    pub amount: Option<f64>,
-    pub currency: Option<String>,
-    pub transaction_type: Option<String>,
-    pub status: Option<String>,
-    pub sender_name: Option<String>,
-    pub receiver_name: Option<String>,
-    pub sender_bank_code: Option<String>,
-    pub receiver_bank_code: Option<String>,
-    pub sender_country: String,
-    pub receiver_country: String,
-    pub fee: f64,
-    pub exchange_rate: f64,
-    pub reference_id: Option<String>,
-    pub memo: Option<String>,
-    pub risk_score: Option<f64>,
-    pub is_flagged: Option<bool>,
-    pub category: Option<String>,
-    pub channel: Option<String>,
-    pub ip_address: Option<String>,
-    pub device_fingerprint: Option<String>,
-    pub session_id: Option<String>,
+pub struct TelemetryOutput {
+    pub event_id: String,
+    pub event_type: String,
+    pub event_time: String,
+    pub sequence_number: i64,
+    pub model: Option<String>,
+    pub model_variant: Option<String>,
+    pub software_version: Option<String>,
+    pub power_state: Option<String>,
+    pub odometer_km: f64,
+    pub charge_percent: Option<f64>,
+    pub remaining_range: Option<f64>,
+    pub kwhr: Option<f64>,
+    pub capacity_kwhr: Option<f64>,
+    pub battery_health_level: Option<f64>,
+    pub max_cell_temp: Option<f64>,
+    pub min_cell_temp: Option<f64>,
+    pub preconditioning_status: Option<String>,
+    pub battery_pack_type: Option<String>,
+    pub charge_state: Option<String>,
+    pub charge_session_id: Option<String>,
+    pub charging_power_kw: Option<f64>,
+    pub energy_added_kwh: Option<f64>,
+    pub ecu: Option<String>,
+    pub dtc_code: Option<String>,
+    pub warning_state: Option<String>,
+    pub update_state: Option<String>,
+    pub target_software_version: Option<String>,
+    pub update_progress_percent: Option<i32>,
     // Kafka metadata
     pub topic: String,
     pub kafka_partition: i32,
     pub kafka_offset: i64,
     pub kafka_timestamp: i64,
-    // T1: null handling
-    pub currency_safe: String,
-    pub risk_score_safe: f64,
-    pub memo_clean: String,
-    // T2: time dimensions
-    pub transaction_date: i32, // days-since-epoch for Arrow Date32
-    pub txn_year: i32,
-    pub txn_month: i32,
-    pub txn_day: i32,
-    pub txn_hour: i32,
-    pub txn_dayofweek: i32,
+    // T1 null handling
+    pub model_safe: String,
+    pub software_version_safe: String,
+    pub power_state_safe: String,
+    // T2 time dimensions
+    pub event_date: i32, // days since epoch (Arrow Date32)
+    pub event_year: i32,
+    pub event_month: i32,
+    pub event_day: i32,
+    pub event_hour: i32,
+    pub event_dayofweek: i32,
     pub is_weekend: bool,
-    pub txn_quarter: i32,
+    pub event_quarter: i32,
     pub date_str: String,
-    // T3: amount features
-    pub amount_bucket: String,
-    pub net_amount: f64,
-    pub fee_pct: Option<f64>,
-    pub amount_usd: f64,
-    pub log_amount: Option<f64>,
-    // T4: risk features
-    pub risk_tier: String,
-    pub risk_level: i32,
-    pub needs_review: bool,
-    // T5: geo features
-    pub is_cross_border: bool,
-    pub corridor: String,
-    pub is_intra_bank: bool,
-    // T6: anonymized
-    pub sender_hash: String,
-    pub receiver_hash: String,
-    pub sender_account_masked: String,
-    pub receiver_account_masked: String,
-    pub ip_anonymized: String,
-    // T7: session features
-    pub device_short_id: String,
-    pub session_prefix: String,
-    pub memo_length: i32,
-    pub has_memo: bool,
+    // T3 battery features
+    pub soc_bucket: String,
+    pub energy_pct: Option<f64>,
+    pub cell_temp_spread: Option<f64>,
+    pub degradation_pct: Option<f64>,
+    pub km_per_percent: Option<f64>,
+    // T4 health features
+    pub health_tier: String,
+    pub thermal_alert: bool,
+    pub is_fault: bool,
+    pub needs_service: bool,
+    pub severity_level: i32,
+    // T5 location (privacy)
+    pub lat_coarse: Option<f64>,
+    pub lon_coarse: Option<f64>,
+    // T6 anonymized (privacy)
+    pub vin_hash: String,
+    pub vin_wmi: String,
+    // T7 event features
     pub row_id: String,
+    pub sw_major: Option<i32>,
+    pub sw_minor: Option<i32>,
 }
 
-// ── Arrow schema for the output Delta table ──────────────────
+// ── Arrow schema: enriched telemetry Delta table ─────────────
 
-pub fn transaction_output_schema() -> Schema {
+pub fn telemetry_output_schema() -> Schema {
+    use DataType::*;
+    let f = |name: &str, dt: DataType, nullable: bool| Field::new(name, dt, nullable);
     Schema::new(vec![
-        Field::new("kafka_key", DataType::Utf8, true),
-        Field::new("transaction_id", DataType::Utf8, false),
-        Field::new("timestamp", DataType::Utf8, false),
-        Field::new("sender_account_id", DataType::Utf8, true),
-        Field::new("receiver_account_id", DataType::Utf8, true),
-        Field::new("sender_account", DataType::Utf8, true),
-        Field::new("receiver_account", DataType::Utf8, true),
-        Field::new("amount", DataType::Float64, true),
-        Field::new("currency", DataType::Utf8, true),
-        Field::new("transaction_type", DataType::Utf8, true),
-        Field::new("status", DataType::Utf8, true),
-        Field::new("sender_name", DataType::Utf8, true),
-        Field::new("receiver_name", DataType::Utf8, true),
-        Field::new("sender_bank_code", DataType::Utf8, true),
-        Field::new("receiver_bank_code", DataType::Utf8, true),
-        Field::new("sender_country", DataType::Utf8, false),
-        Field::new("receiver_country", DataType::Utf8, false),
-        Field::new("fee", DataType::Float64, false),
-        Field::new("exchange_rate", DataType::Float64, false),
-        Field::new("reference_id", DataType::Utf8, true),
-        Field::new("memo", DataType::Utf8, true),
-        Field::new("risk_score", DataType::Float64, true),
-        Field::new("is_flagged", DataType::Boolean, true),
-        Field::new("category", DataType::Utf8, true),
-        Field::new("channel", DataType::Utf8, true),
-        Field::new("ip_address", DataType::Utf8, true),
-        Field::new("device_fingerprint", DataType::Utf8, true),
-        Field::new("session_id", DataType::Utf8, true),
-        Field::new("topic", DataType::Utf8, false),
-        Field::new("kafka_partition", DataType::Int32, false),
-        Field::new("kafka_offset", DataType::Int64, false),
-        Field::new("kafka_timestamp", DataType::Int64, false),
-        // T1
-        Field::new("currency_safe", DataType::Utf8, false),
-        Field::new("risk_score_safe", DataType::Float64, false),
-        Field::new("memo_clean", DataType::Utf8, false),
-        // T2
-        Field::new("transaction_date", DataType::Date32, false),
-        Field::new("txn_year", DataType::Int32, false),
-        Field::new("txn_month", DataType::Int32, false),
-        Field::new("txn_day", DataType::Int32, false),
-        Field::new("txn_hour", DataType::Int32, false),
-        Field::new("txn_dayofweek", DataType::Int32, false),
-        Field::new("is_weekend", DataType::Boolean, false),
-        Field::new("txn_quarter", DataType::Int32, false),
-        Field::new("date_str", DataType::Utf8, false),
-        // T3
-        Field::new("amount_bucket", DataType::Utf8, false),
-        Field::new("net_amount", DataType::Float64, false),
-        Field::new("fee_pct", DataType::Float64, true),
-        Field::new("amount_usd", DataType::Float64, false),
-        Field::new("log_amount", DataType::Float64, true),
-        // T4
-        Field::new("risk_tier", DataType::Utf8, false),
-        Field::new("risk_level", DataType::Int32, false),
-        Field::new("needs_review", DataType::Boolean, false),
-        // T5
-        Field::new("is_cross_border", DataType::Boolean, false),
-        Field::new("corridor", DataType::Utf8, false),
-        Field::new("is_intra_bank", DataType::Boolean, false),
-        // T6
-        Field::new("sender_hash", DataType::Utf8, false),
-        Field::new("receiver_hash", DataType::Utf8, false),
-        Field::new("sender_account_masked", DataType::Utf8, false),
-        Field::new("receiver_account_masked", DataType::Utf8, false),
-        Field::new("ip_anonymized", DataType::Utf8, false),
-        // T7
-        Field::new("device_short_id", DataType::Utf8, false),
-        Field::new("session_prefix", DataType::Utf8, false),
-        Field::new("memo_length", DataType::Int32, false),
-        Field::new("has_memo", DataType::Boolean, false),
-        Field::new("row_id", DataType::Utf8, false),
+        f("event_id", Utf8, false),
+        f("event_type", Utf8, false),
+        f("event_time", Utf8, false),
+        f("sequence_number", Int64, false),
+        f("model", Utf8, true),
+        f("model_variant", Utf8, true),
+        f("software_version", Utf8, true),
+        f("power_state", Utf8, true),
+        f("odometer_km", Float64, false),
+        f("charge_percent", Float64, true),
+        f("remaining_range", Float64, true),
+        f("kwhr", Float64, true),
+        f("capacity_kwhr", Float64, true),
+        f("battery_health_level", Float64, true),
+        f("max_cell_temp", Float64, true),
+        f("min_cell_temp", Float64, true),
+        f("preconditioning_status", Utf8, true),
+        f("battery_pack_type", Utf8, true),
+        f("charge_state", Utf8, true),
+        f("charge_session_id", Utf8, true),
+        f("charging_power_kw", Float64, true),
+        f("energy_added_kwh", Float64, true),
+        f("ecu", Utf8, true),
+        f("dtc_code", Utf8, true),
+        f("warning_state", Utf8, true),
+        f("update_state", Utf8, true),
+        f("target_software_version", Utf8, true),
+        f("update_progress_percent", Int32, true),
+        f("topic", Utf8, false),
+        f("kafka_partition", Int32, false),
+        f("kafka_offset", Int64, false),
+        f("kafka_timestamp", Int64, false),
+        f("model_safe", Utf8, false),
+        f("software_version_safe", Utf8, false),
+        f("power_state_safe", Utf8, false),
+        f("event_date", Date32, false),
+        f("event_year", Int32, false),
+        f("event_month", Int32, false),
+        f("event_day", Int32, false),
+        f("event_hour", Int32, false),
+        f("event_dayofweek", Int32, false),
+        f("is_weekend", Boolean, false),
+        f("event_quarter", Int32, false),
+        f("date_str", Utf8, false),
+        f("soc_bucket", Utf8, false),
+        f("energy_pct", Float64, true),
+        f("cell_temp_spread", Float64, true),
+        f("degradation_pct", Float64, true),
+        f("km_per_percent", Float64, true),
+        f("health_tier", Utf8, false),
+        f("thermal_alert", Boolean, false),
+        f("is_fault", Boolean, false),
+        f("needs_service", Boolean, false),
+        f("severity_level", Int32, false),
+        f("lat_coarse", Float64, true),
+        f("lon_coarse", Float64, true),
+        f("vin_hash", Utf8, false),
+        f("vin_wmi", Utf8, false),
+        f("row_id", Utf8, false),
+        f("sw_major", Int32, true),
+        f("sw_minor", Int32, true),
     ])
 }
 
-// ── Arrow schema for accounts Delta table ────────────────────
+// ── Arrow schema: vehicle_state Delta table ──────────────────
 
-pub fn account_output_schema() -> Schema {
+pub fn vehicle_state_schema() -> Schema {
+    use DataType::*;
+    let f = |name: &str, dt: DataType, nullable: bool| Field::new(name, dt, nullable);
     Schema::new(vec![
-        Field::new("account_id", DataType::Utf8, false),
-        Field::new("account_number", DataType::Utf8, true),
-        Field::new("holder_name", DataType::Utf8, true),
-        Field::new("bank_code", DataType::Utf8, true),
-        Field::new("country", DataType::Utf8, true),
-        Field::new("currency", DataType::Utf8, true),
-        Field::new("account_type", DataType::Utf8, true),
-        Field::new("account_status", DataType::Utf8, true),
-        Field::new("balance", DataType::Float64, true),
-        Field::new("total_sent", DataType::Float64, true),
-        Field::new("total_received", DataType::Float64, true),
-        Field::new("transaction_count", DataType::Int32, true),
-        Field::new("risk_rating", DataType::Float64, true),
-        Field::new("kyc_level", DataType::Utf8, true),
-        Field::new("last_transaction_time", DataType::Utf8, true),
-        Field::new("updated_at", DataType::Utf8, true),
-        Field::new("created_at", DataType::Utf8, true),
+        f("vin", Utf8, false),
+        f("model", Utf8, true),
+        f("model_variant", Utf8, true),
+        f("battery_pack_type", Utf8, true),
+        f("software_version", Utf8, true),
+        f("power_state", Utf8, true),
+        f("odometer_km", Float64, true),
+        f("charge_percent", Float64, true),
+        f("battery_health_level", Float64, true),
+        f("last_event_type", Utf8, true),
+        f("sequence_number", Int64, false),
+        f("event_count", Int32, true),
+        f("updated_at", Utf8, true),
+        f("first_seen_at", Utf8, true),
     ])
 }
 
-// ── Build Arrow RecordBatch from transformed records ─────────
+// ── Column builders ──────────────────────────────────────────
 
 macro_rules! col_utf8 {
     ($recs:expr, $f:ident) => {
-        Arc::new(StringArray::from_iter_values($recs.iter().map(|r| r.$f.as_str())))
-            as Arc<dyn Array>
+        Arc::new(StringArray::from_iter_values($recs.iter().map(|r| r.$f.as_str()))) as ArrayRef
     };
 }
-
 macro_rules! col_utf8_opt {
     ($recs:expr, $f:ident) => {
-        Arc::new(StringArray::from(
-            $recs.iter().map(|r| r.$f.as_deref()).collect::<Vec<_>>(),
-        )) as Arc<dyn Array>
+        Arc::new(StringArray::from($recs.iter().map(|r| r.$f.as_deref()).collect::<Vec<_>>()))
+            as ArrayRef
     };
 }
-
 macro_rules! col_f64 {
     ($recs:expr, $f:ident) => {
-        Arc::new(Float64Array::from_iter_values($recs.iter().map(|r| r.$f)))
-            as Arc<dyn Array>
+        Arc::new(Float64Array::from_iter_values($recs.iter().map(|r| r.$f))) as ArrayRef
     };
 }
-
 macro_rules! col_f64_opt {
     ($recs:expr, $f:ident) => {
-        Arc::new(Float64Array::from(
-            $recs.iter().map(|r| r.$f).collect::<Vec<_>>(),
-        )) as Arc<dyn Array>
+        Arc::new(Float64Array::from($recs.iter().map(|r| r.$f).collect::<Vec<_>>())) as ArrayRef
     };
 }
-
 macro_rules! col_i32 {
     ($recs:expr, $f:ident) => {
-        Arc::new(Int32Array::from_iter_values($recs.iter().map(|r| r.$f)))
-            as Arc<dyn Array>
+        Arc::new(Int32Array::from_iter_values($recs.iter().map(|r| r.$f))) as ArrayRef
     };
 }
-
+macro_rules! col_i32_opt {
+    ($recs:expr, $f:ident) => {
+        Arc::new(Int32Array::from($recs.iter().map(|r| r.$f).collect::<Vec<_>>())) as ArrayRef
+    };
+}
 macro_rules! col_i64 {
     ($recs:expr, $f:ident) => {
-        Arc::new(Int64Array::from_iter_values($recs.iter().map(|r| r.$f)))
-            as Arc<dyn Array>
+        Arc::new(Int64Array::from_iter_values($recs.iter().map(|r| r.$f))) as ArrayRef
     };
 }
-
 macro_rules! col_bool {
     ($recs:expr, $f:ident) => {
-        Arc::new(BooleanArray::from($recs.iter().map(|r| r.$f).collect::<Vec<_>>()))
-            as Arc<dyn Array>
+        Arc::new(BooleanArray::from($recs.iter().map(|r| r.$f).collect::<Vec<_>>())) as ArrayRef
     };
 }
 
-macro_rules! col_bool_opt {
-    ($recs:expr, $f:ident) => {
-        Arc::new(BooleanArray::from(
-            $recs.iter().map(|r| r.$f).collect::<Vec<Option<bool>>>(),
-        )) as Arc<dyn Array>
-    };
+pub fn build_telemetry_batch(r: &[TelemetryOutput]) -> anyhow::Result<RecordBatch> {
+    let event_date =
+        Arc::new(Date32Array::from_iter_values(r.iter().map(|x| x.event_date))) as ArrayRef;
+    let columns: Vec<ArrayRef> = vec![
+        col_utf8!(r, event_id),
+        col_utf8!(r, event_type),
+        col_utf8!(r, event_time),
+        col_i64!(r, sequence_number),
+        col_utf8_opt!(r, model),
+        col_utf8_opt!(r, model_variant),
+        col_utf8_opt!(r, software_version),
+        col_utf8_opt!(r, power_state),
+        col_f64!(r, odometer_km),
+        col_f64_opt!(r, charge_percent),
+        col_f64_opt!(r, remaining_range),
+        col_f64_opt!(r, kwhr),
+        col_f64_opt!(r, capacity_kwhr),
+        col_f64_opt!(r, battery_health_level),
+        col_f64_opt!(r, max_cell_temp),
+        col_f64_opt!(r, min_cell_temp),
+        col_utf8_opt!(r, preconditioning_status),
+        col_utf8_opt!(r, battery_pack_type),
+        col_utf8_opt!(r, charge_state),
+        col_utf8_opt!(r, charge_session_id),
+        col_f64_opt!(r, charging_power_kw),
+        col_f64_opt!(r, energy_added_kwh),
+        col_utf8_opt!(r, ecu),
+        col_utf8_opt!(r, dtc_code),
+        col_utf8_opt!(r, warning_state),
+        col_utf8_opt!(r, update_state),
+        col_utf8_opt!(r, target_software_version),
+        col_i32_opt!(r, update_progress_percent),
+        col_utf8!(r, topic),
+        col_i32!(r, kafka_partition),
+        col_i64!(r, kafka_offset),
+        col_i64!(r, kafka_timestamp),
+        col_utf8!(r, model_safe),
+        col_utf8!(r, software_version_safe),
+        col_utf8!(r, power_state_safe),
+        event_date,
+        col_i32!(r, event_year),
+        col_i32!(r, event_month),
+        col_i32!(r, event_day),
+        col_i32!(r, event_hour),
+        col_i32!(r, event_dayofweek),
+        col_bool!(r, is_weekend),
+        col_i32!(r, event_quarter),
+        col_utf8!(r, date_str),
+        col_utf8!(r, soc_bucket),
+        col_f64_opt!(r, energy_pct),
+        col_f64_opt!(r, cell_temp_spread),
+        col_f64_opt!(r, degradation_pct),
+        col_f64_opt!(r, km_per_percent),
+        col_utf8!(r, health_tier),
+        col_bool!(r, thermal_alert),
+        col_bool!(r, is_fault),
+        col_bool!(r, needs_service),
+        col_i32!(r, severity_level),
+        col_f64_opt!(r, lat_coarse),
+        col_f64_opt!(r, lon_coarse),
+        col_utf8!(r, vin_hash),
+        col_utf8!(r, vin_wmi),
+        col_utf8!(r, row_id),
+        col_i32_opt!(r, sw_major),
+        col_i32_opt!(r, sw_minor),
+    ];
+    Ok(RecordBatch::try_new(Arc::new(telemetry_output_schema()), columns)?)
 }
 
-pub fn build_transaction_batch(records: &[TransactionOutput]) -> anyhow::Result<RecordBatch> {
-    let schema = Arc::new(transaction_output_schema());
-
-    // Date32 array
-    let date_arr = Arc::new(Date32Array::from_iter_values(
-        records.iter().map(|r| r.transaction_date),
-    )) as Arc<dyn Array>;
-
-    let columns: Vec<Arc<dyn Array>> = vec![
-        col_utf8_opt!(records, kafka_key),
-        col_utf8!(records, transaction_id),
-        col_utf8!(records, timestamp),
-        col_utf8_opt!(records, sender_account_id),
-        col_utf8_opt!(records, receiver_account_id),
-        col_utf8_opt!(records, sender_account),
-        col_utf8_opt!(records, receiver_account),
-        col_f64_opt!(records, amount),
-        col_utf8_opt!(records, currency),
-        col_utf8_opt!(records, transaction_type),
-        col_utf8_opt!(records, status),
-        col_utf8_opt!(records, sender_name),
-        col_utf8_opt!(records, receiver_name),
-        col_utf8_opt!(records, sender_bank_code),
-        col_utf8_opt!(records, receiver_bank_code),
-        col_utf8!(records, sender_country),
-        col_utf8!(records, receiver_country),
-        col_f64!(records, fee),
-        col_f64!(records, exchange_rate),
-        col_utf8_opt!(records, reference_id),
-        col_utf8_opt!(records, memo),
-        col_f64_opt!(records, risk_score),
-        col_bool_opt!(records, is_flagged),
-        col_utf8_opt!(records, category),
-        col_utf8_opt!(records, channel),
-        col_utf8_opt!(records, ip_address),
-        col_utf8_opt!(records, device_fingerprint),
-        col_utf8_opt!(records, session_id),
-        col_utf8!(records, topic),
-        col_i32!(records, kafka_partition),
-        col_i64!(records, kafka_offset),
-        col_i64!(records, kafka_timestamp),
-        // T1
-        col_utf8!(records, currency_safe),
-        col_f64!(records, risk_score_safe),
-        col_utf8!(records, memo_clean),
-        // T2
-        date_arr,
-        col_i32!(records, txn_year),
-        col_i32!(records, txn_month),
-        col_i32!(records, txn_day),
-        col_i32!(records, txn_hour),
-        col_i32!(records, txn_dayofweek),
-        col_bool!(records, is_weekend),
-        col_i32!(records, txn_quarter),
-        col_utf8!(records, date_str),
-        // T3
-        col_utf8!(records, amount_bucket),
-        col_f64!(records, net_amount),
-        col_f64_opt!(records, fee_pct),
-        col_f64!(records, amount_usd),
-        col_f64_opt!(records, log_amount),
-        // T4
-        col_utf8!(records, risk_tier),
-        col_i32!(records, risk_level),
-        col_bool!(records, needs_review),
-        // T5
-        col_bool!(records, is_cross_border),
-        col_utf8!(records, corridor),
-        col_bool!(records, is_intra_bank),
-        // T6
-        col_utf8!(records, sender_hash),
-        col_utf8!(records, receiver_hash),
-        col_utf8!(records, sender_account_masked),
-        col_utf8!(records, receiver_account_masked),
-        col_utf8!(records, ip_anonymized),
-        // T7
-        col_utf8!(records, device_short_id),
-        col_utf8!(records, session_prefix),
-        col_i32!(records, memo_length),
-        col_bool!(records, has_memo),
-        col_utf8!(records, row_id),
+pub fn build_vehicle_state_batch(r: &[VehicleStateInput]) -> anyhow::Result<RecordBatch> {
+    let columns: Vec<ArrayRef> = vec![
+        col_utf8!(r, vin),
+        col_utf8_opt!(r, model),
+        col_utf8_opt!(r, model_variant),
+        col_utf8_opt!(r, battery_pack_type),
+        col_utf8_opt!(r, software_version),
+        col_utf8_opt!(r, power_state),
+        col_f64_opt!(r, odometer_km),
+        col_f64_opt!(r, charge_percent),
+        col_f64_opt!(r, battery_health_level),
+        col_utf8_opt!(r, last_event_type),
+        col_i64!(r, sequence_number),
+        col_i32_opt!(r, event_count),
+        col_utf8_opt!(r, updated_at),
+        col_utf8_opt!(r, first_seen_at),
     ];
-
-    Ok(RecordBatch::try_new(schema, columns)?)
-}
-
-pub fn build_account_batch(records: &[AccountInput]) -> anyhow::Result<RecordBatch> {
-    let schema = Arc::new(account_output_schema());
-    let columns: Vec<Arc<dyn Array>> = vec![
-        Arc::new(StringArray::from_iter_values(records.iter().map(|r| r.account_id.as_str()))),
-        Arc::new(StringArray::from(records.iter().map(|r| r.account_number.as_deref()).collect::<Vec<_>>())),
-        Arc::new(StringArray::from(records.iter().map(|r| r.holder_name.as_deref()).collect::<Vec<_>>())),
-        Arc::new(StringArray::from(records.iter().map(|r| r.bank_code.as_deref()).collect::<Vec<_>>())),
-        Arc::new(StringArray::from(records.iter().map(|r| r.country.as_deref()).collect::<Vec<_>>())),
-        Arc::new(StringArray::from(records.iter().map(|r| r.currency.as_deref()).collect::<Vec<_>>())),
-        Arc::new(StringArray::from(records.iter().map(|r| r.account_type.as_deref()).collect::<Vec<_>>())),
-        Arc::new(StringArray::from(records.iter().map(|r| r.account_status.as_deref()).collect::<Vec<_>>())),
-        Arc::new(Float64Array::from(records.iter().map(|r| r.balance).collect::<Vec<_>>())),
-        Arc::new(Float64Array::from(records.iter().map(|r| r.total_sent).collect::<Vec<_>>())),
-        Arc::new(Float64Array::from(records.iter().map(|r| r.total_received).collect::<Vec<_>>())),
-        Arc::new(Int32Array::from(records.iter().map(|r| r.transaction_count).collect::<Vec<_>>())),
-        Arc::new(Float64Array::from(records.iter().map(|r| r.risk_rating).collect::<Vec<_>>())),
-        Arc::new(StringArray::from(records.iter().map(|r| r.kyc_level.as_deref()).collect::<Vec<_>>())),
-        Arc::new(StringArray::from(records.iter().map(|r| r.last_transaction_time.as_deref()).collect::<Vec<_>>())),
-        Arc::new(StringArray::from(records.iter().map(|r| r.updated_at.as_deref()).collect::<Vec<_>>())),
-        Arc::new(StringArray::from(records.iter().map(|r| r.created_at.as_deref()).collect::<Vec<_>>())),
-    ];
-    Ok(RecordBatch::try_new(schema, columns)?)
+    Ok(RecordBatch::try_new(Arc::new(vehicle_state_schema()), columns)?)
 }

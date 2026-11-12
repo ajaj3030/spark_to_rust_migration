@@ -1,208 +1,153 @@
-# Spark-to-Rust Migration — Financial Transactions Pipeline
+# Vehicle Telemetry Pipeline — Spark → Rust Migration
 
-A high-throughput data pipeline that generates synthetic financial transaction data, streams it through Kafka, processes it with Spark Structured Streaming, and writes to Delta Lake. Designed as a baseline Spark implementation for benchmarking against a future Rust port.
+A vehicle-to-cloud telemetry pipeline midway through a migration from Spark
+Structured Streaming to Rust stream processors. Synthetic EV telemetry
+(battery, charging, diagnostics, OTA update status) flows through Kafka,
+keyed by VIN, into Delta Lake tables that downstream service, warranty and
+OTA systems read.
+
+Two jobs are already ported to Rust and proven equivalent by a parity
+check. The batch analytics jobs are still Spark-only.
+
+## Provenance
+
+- **Forked from** [PragnaMohapatra/spark_to_rust_migration](https://github.com/PragnaMohapatra/spark_to_rust_migration)
+  (Apache-2.0), a Spark vs Rust benchmark on a financial-transactions
+  workload. This fork replaces that workload with vehicle telemetry.
+- **Field names and enum values** (`charge_percent`, `battery_health_level`,
+  `CHARGE_STATE_*`, `UPDATE_STATE_*`, `MODEL_AIR`, …) are modelled on the
+  community-documented Lucid mobile-gateway protobufs in
+  [nshp/python-lucidmotors](https://github.com/nshp/python-lucidmotors)
+  (MIT; unofficial, no affiliation with Lucid Motors). Those describe the
+  app-facing API, not an internal telemetry stream; the event envelope
+  (`event_id`, `sequence_number`, `event_type`) is our own.
+- **All data is synthetic.** VINs, locations and readings are generated.
 
 ## Architecture
 
 ```
-┌──────────────────┐     ┌─────────────┐     ┌──────────────────┐     ┌──────────────┐
-│  Data Generator   │────▶│    Kafka     │────▶│  Spark Streaming │────▶│  Delta Lake  │
-│  (Python, 4 thr) │     │ (8 partns)  │     │  (Structured)    │     │  (Parquet)   │
-│  ~5 GB / run      │     │             │     │                  │     │              │
-└──────────────────┘     └─────────────┘     └──────────────────┘     └──────────────┘
-                                                                            │
-                                                                ┌───────────┴──────────┐
-                                                                │                      │
-                                                          ┌─────▼──────┐    ┌──────────▼──┐
-                                                          │Delta Viewer│    │Cleanup Tool  │
-                                                          │ (CLI/SQL)  │    │(vacuum/purge)│
-                                                          └────────────┘    └─────────────┘
+data_generator ──► Kafka ─┬─ vehicle_telemetry (key = VIN) ─┬─► Spark  streaming_job.py   ─► delta_output/vehicle_telemetry
+                          │                                  └─► Rust   rust-pipeline stream ─► delta_output/vehicle_telemetry_rust
+                          │
+                          └─ vehicle_state_updates (key = VIN, compacted)
+                                                             ├─► Spark  vehicle_state_job.py ─► delta_output/vehicle_state
+                                                             └─► Rust   rust-pipeline state  ─► delta_output/vehicle_state_rust
+
+rust-pipeline validate  ──  compares each Spark table with its Rust twin (the migration acceptance gate)
 ```
 
-**Data domain**: Synthetic financial transactions (25 fields per record, ~500 bytes each).
+## Migration status
 
-## Components
+| Job | Spark | Rust | Parity |
+|---|---|---|---|
+| Telemetry enrichment (`streaming_job.py`) | ✅ | ✅ `rust-pipeline stream` | `validate` |
+| Vehicle state MERGE (`vehicle_state_job.py`) | ✅ | ✅ `rust-pipeline state` | `validate --state` |
+| Batch analytics (`batch_analytics_job.py`) | still finance-schema; being converted | ❌ not ported | — |
 
-| Component | Path | Description |
-|-----------|------|-------------|
-| Data Generator | `data_generator/` | Multi-threaded Kafka producer using Faker. Pumps 5 GB per run. |
-| Spark Streaming | `spark_jobs/streaming_job.py` | Structured Streaming: Kafka → parse → enrich → Delta Lake |
-| Spark Batch | `spark_jobs/batch_job.py` | One-shot batch reprocessing of Kafka topic into Delta |
-| Delta Viewer | `delta_viewer/` | Rich CLI to inspect schema, stats, history, partitions, and run SQL |
-| Cleanup Tool | `cleanup/` | Vacuum, compact, purge Delta tables; reset Kafka topics |
-| Infrastructure | `docker-compose.yml` | Zookeeper + Kafka (8 partitions) + Spark master/worker |
-| Config | `config/app_config.yaml` | Centralized pipeline configuration |
+## Guarantees the pipeline relies on
 
-## Quick Start
+**Ordering.** Every message is keyed by VIN, so one vehicle's events stay in
+one partition in order. The generator shards vehicles across producer
+threads (one producer per VIN) with `max_in_flight_requests_per_connection=1`.
+Each event also carries a per-VIN `sequence_number`.
 
-### Prerequisites
-- Python 3.10+
-- Docker & Docker Compose
-- Java 11+ (for local Spark)
+**Exactly-once effect.** Spark uses streaming checkpoints. Rust commits Kafka
+offsets to a local SQLite checkpoint after each Delta write and resumes from
+it. The vehicle-state MERGE only applies a snapshot when its
+`sequence_number` is newer than the stored one, so replays and out-of-order
+arrivals cannot regress a vehicle's state.
 
-### 1. Setup
+**Privacy.** The enriched telemetry table never holds the raw VIN or precise
+GPS: the VIN becomes `vin_hash` (SHA-256) plus `vin_wmi` (manufacturer
+code), coordinates are rounded to 2 dp (~1 km), and the Kafka key (the VIN)
+is dropped. `validate` fails if `vin`, `latitude`, `longitude` or
+`kafka_key` appears in either table. The `vehicle_state` table is keyed by
+VIN by design: it is the operational lookup for service and warranty, and
+carries no location.
+
+## Parity validation
 
 ```bash
-# Linux/macOS
-./scripts/setup.sh
-
-# Windows
-.\scripts\setup.ps1
+./rust_pipeline/target/debug/rust-pipeline --config config/app_config.yaml validate --state
 ```
 
-### 2. Start Infrastructure
+PASS requires no missing rows on either side, every compared column equal
+on every row (doubles within 1e-9), and no raw PII columns. Reports are
+written to `logs/validation_report_<table>.json`; the command exits
+non-zero on FAIL so CI can gate on it.
+
+Rust reproduces Spark's `round()` exactly (`transforms/rounding.rs`): Spark
+rounds HALF_UP on the decimal form of the double, so `round(1.005, 2)` is
+1.01, where naive float rounding gives 1.0.
+
+## Quick start
+
+Prerequisites: Docker, Rust (`rustup`), cmake, Python 3.10+.
 
 ```bash
-docker compose up -d
-```
+# 1. Python env for the generator
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-Wait for Kafka to be healthy (~15s), then create the topic:
-
-```bash
+# 2. Kafka + Spark, then create topics
+docker compose up -d zookeeper kafka spark-master spark-worker
 docker compose up kafka-setup
+
+# 3. Build the Rust pipeline (CMake 4 needs the policy floor for bundled librdkafka)
+(cd rust_pipeline && CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo build)
+
+# 4. Generate ~50 MB of telemetry (2,000 vehicles)
+.venv/bin/python -m data_generator.run --target-gb 0.05
+
+# 5. Spark jobs (inside the cluster)
+JARS=$(docker exec spark-master bash -c 'ls /opt/extra-jars/*.jar | paste -sd, -')
+docker exec -d -w /opt spark-master bash -c "/opt/spark/bin/spark-submit --master spark://spark-master:7077 \
+  --total-executor-cores 2 --jars $JARS --py-files /opt/spark-jobs/transforms.py \
+  /opt/spark-jobs/streaming_job.py --config /opt/config/app_config.yaml > /opt/logs/spark_telemetry.log 2>&1"
+docker exec -d -w /opt spark-master bash -c "/opt/spark/bin/spark-submit --master spark://spark-master:7077 \
+  --total-executor-cores 2 --jars $JARS --py-files /opt/extra-jars/delta-spark_2.12-3.1.0.jar \
+  /opt/spark-jobs/vehicle_state_job.py --config /opt/config/app_config.yaml > /opt/logs/spark_state.log 2>&1"
+
+# 6. Rust jobs (run from the repo root so relative paths line up with Spark's)
+./rust_pipeline/target/debug/rust-pipeline --config config/app_config.yaml stream &
+./rust_pipeline/target/debug/rust-pipeline --config config/app_config.yaml state &
+
+# 7. Once both sides have processed the data
+./rust_pipeline/target/debug/rust-pipeline --config config/app_config.yaml validate --state
 ```
 
-### 3. Generate Data (5 GB)
+Unit tests: `(cd rust_pipeline && CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo test)`.
 
-```bash
-# Activate venv first
-source .venv/bin/activate          # Linux/macOS
-.\.venv\Scripts\Activate.ps1       # Windows
+## Event schema
 
-# Generate 5 GB (default)
-python -m data_generator.run
+Topic `vehicle_telemetry`, one JSON event per message. `event_type` decides
+which group of fields is populated; the rest are null.
 
-# Generate 1 GB (quick test)
-python -m data_generator.run --target-gb 1
+| Group | Fields |
+|---|---|
+| Envelope | `event_id`, `vin`, `event_type` (BATTERY · CHARGING · DIAGNOSTIC · OTA), `event_time` (UTC), `sequence_number` |
+| Vehicle context | `model`, `model_variant`, `software_version`, `power_state`, `latitude`, `longitude`, `odometer_km` |
+| BATTERY | `charge_percent`, `remaining_range`, `kwhr`, `capacity_kwhr`, `battery_health_level`, `max_cell_temp`, `min_cell_temp`, `preconditioning_status`, `battery_pack_type` |
+| CHARGING | `charge_percent`, `charge_state`, `charge_session_id`, `charging_power_kw`, `energy_added_kwh` |
+| DIAGNOSTIC | `ecu`, `dtc_code`, `warning_state` |
+| OTA | `update_state`, `target_software_version`, `update_progress_percent` |
 
-# Generate 10 GB with 8 threads
-python -m data_generator.run --target-gb 10 --threads 8
-```
+Topic `vehicle_state_updates`: one snapshot per event (`vin`, model,
+software version, power state, odometer, charge, health, `last_event_type`,
+`sequence_number`, `event_count`, `updated_at`, `first_seen_at`).
 
-### 4. Run Spark Streaming Job
+Enrichment (`spark_jobs/transforms.py`, mirrored in
+`rust_pipeline/src/transforms/`): T1 null defaults · T2 time dimensions ·
+T3 battery metrics (`soc_bucket`, `energy_pct`, `cell_temp_spread`,
+`degradation_pct`, `km_per_percent`) · T4 health flags (`health_tier`,
+`thermal_alert`, `is_fault`, `needs_service`, `severity_level`) · T5 GPS
+coarsening · T6 VIN pseudonymisation · T7 `row_id`, `sw_major`, `sw_minor`.
 
-**Local mode** (no cluster needed):
-```bash
-python spark_jobs/streaming_job.py --local
-```
+## Not yet updated for telemetry
 
-**Docker mode** (uses Spark cluster):
-```bash
-docker exec spark-master spark-submit \
-    --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,io.delta:delta-spark_2.12:3.1.0 \
-    /opt/spark-jobs/streaming_job.py
-```
-
-### 5. Inspect Delta Table
-
-```bash
-python -m delta_viewer.viewer info          # Table metadata
-python -m delta_viewer.viewer schema        # Column types
-python -m delta_viewer.viewer stats         # Row counts, null %, amount distribution
-python -m delta_viewer.viewer sample        # Preview 10 rows
-python -m delta_viewer.viewer history       # Commit log
-python -m delta_viewer.viewer partitions    # Partition layout
-
-# SQL queries (requires: pip install duckdb)
-python -m delta_viewer.viewer query --sql "SELECT currency, COUNT(*) cnt FROM txn GROUP BY currency ORDER BY cnt DESC"
-```
-
-### 6. Cleanup
-
-```bash
-python -m cleanup.cleanup status            # What exists
-python -m cleanup.cleanup vacuum            # Remove old Delta files
-python -m cleanup.cleanup compact           # Merge small files
-python -m cleanup.cleanup purge             # Delete Delta table
-python -m cleanup.cleanup kafka-reset       # Reset Kafka topic
-python -m cleanup.cleanup full-reset --yes  # Everything
-```
-
-### 7. Stop
-
-```bash
-docker compose down
-```
-
-## Configuration
-
-All settings are in [`config/app_config.yaml`](config/app_config.yaml):
-
-| Section | Key Settings |
-|---------|-------------|
-| `kafka` | bootstrap servers, topic, partitions |
-| `generator` | `target_bytes` (5 GB default), batch size, thread count |
-| `spark` | master URL, trigger interval, checkpoint/output paths, shuffle partitions |
-| `delta` | table path, vacuum retention, compact threshold |
-
-## Data Schema
-
-Each financial transaction record contains 25 fields:
-
-| Field | Type | Example |
-|-------|------|---------|
-| `transaction_id` | UUID | `a1b2c3d4-...` |
-| `timestamp` | ISO-8601 | `2026-03-21T14:30:00+00:00` |
-| `sender_account` | string(16) | `4829103847561029` |
-| `amount` | float | `12499.50` |
-| `currency` | ISO-4217 | `USD` |
-| `transaction_type` | enum | `WIRE`, `ACH`, `CARD`, `P2P`, `CHECK` |
-| `status` | enum | `COMPLETED`, `PENDING`, `FAILED`, `REVERSED` |
-| `risk_score` | float | `0.0342` |
-| `is_flagged` | bool | `false` |
-| `category` | enum | `RETAIL`, `CORPORATE`, `GOVERNMENT`, `INTERBANK` |
-| `channel` | enum | `ONLINE`, `BRANCH`, `ATM`, `MOBILE`, `API` |
-| ... | | *(25 fields total — see `data_generator/schemas.py`)* |
-
-**Enriched columns** added by Spark: `transaction_date`, `txn_year`, `txn_month`, `amount_bucket`
-
-## 5 GB Throughput Design
-
-- **Record size**: ~500 bytes JSON → ~10M records per 5 GB
-- **Generator**: 4 threads × 10K batch = 40K records/flush → ~100–200 MB/s throughput
-- **Kafka**: 8 partitions, LZ4 compression, 128 MB producer buffer
-- **Spark**: 500K offsets/trigger, 8 shuffle partitions, append mode
-
-## Project Structure
-
-```
-spark_to_rust_migration/
-├── config/
-│   └── app_config.yaml          # Pipeline configuration
-├── data_generator/
-│   ├── __init__.py
-│   ├── generator.py             # Multi-threaded Kafka producer
-│   ├── run.py                   # CLI entry point
-│   └── schemas.py               # Transaction data schema
-├── spark_jobs/
-│   ├── streaming_job.py         # Kafka → Delta streaming
-│   └── batch_job.py             # Kafka → Delta batch
-├── delta_viewer/
-│   ├── __init__.py
-│   └── viewer.py                # Rich CLI table inspector
-├── cleanup/
-│   ├── __init__.py
-│   └── cleanup.py               # Vacuum, compact, purge, reset
-├── scripts/
-│   ├── setup.sh                 # Linux/macOS setup
-│   ├── setup.ps1                # Windows setup
-│   ├── start_pipeline.sh        # Start everything
-│   └── stop_pipeline.sh         # Stop everything
-├── docker-compose.yml           # Kafka + Spark infrastructure
-├── requirements.txt             # Python dependencies
-├── .gitignore
-├── LICENSE
-└── README.md
-```
-
-## Future: Rust Migration
-
-This Spark pipeline serves as the **baseline** for performance benchmarking. The migration plan:
-
-1. **Phase 1** (this repo): Fully working Spark pipeline with 5 GB data generation
-2. **Phase 2**: Rust implementation using `rdkafka` + `delta-rs` + `arrow-rs`
-3. **Phase 3**: Side-by-side benchmarking — throughput, latency, resource usage
+`dashboard/`, `delta_viewer/`, `cleanup/` and
+`scripts/generate_pipeline_report.py` still assume the original
+financial-transactions schema.
 
 ## License
 
-MIT
+Apache-2.0, inherited from the upstream project (see `LICENSE`).

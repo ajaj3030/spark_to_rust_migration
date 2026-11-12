@@ -1,11 +1,13 @@
 # ──────────────────────────────────────────────────────────────
-# Spark-to-Rust Migration — Pipeline Configuration
+# Vehicle Telemetry Pipeline (Spark → Rust migration) — Configuration
 # ──────────────────────────────────────────────────────────────
 
 kafka:
   bootstrap_servers: "localhost:9092"
-  topic: "financial_transactions"
-  account_topic: "account_updates"
+  # Vehicle-to-cloud telemetry events, keyed by VIN
+  topic: "vehicle_telemetry"
+  # Per-vehicle latest-state snapshots, keyed by VIN (log-compacted)
+  state_topic: "vehicle_state_updates"
   partitions: 8
   # For docker-internal Spark access use kafka:29092
   internal_bootstrap_servers: "kafka:29092"
@@ -15,23 +17,26 @@ generator:
   target_bytes: 5368709120
   # Records per Kafka produce batch
   batch_size: 10000
-  # Number of parallel producer threads
+  # Number of parallel producer threads (vehicles are sharded across threads
+  # so each VIN is always produced by one producer → per-VIN ordering holds)
   num_threads: 4
-  # Estimated bytes per serialized record (~500 bytes avg)
-  avg_record_bytes: 500
+  # Size of the simulated fleet
+  num_vehicles: 2000
+  # Estimated bytes per serialized record
+  avg_record_bytes: 820
 
 spark:
-  app_name: "FinancialTransactionsPipeline"
+  app_name: "VehicleTelemetryPipeline"
   master: "spark://spark-master:7077"
   # Structured streaming trigger interval
   trigger_interval: "10 seconds"
   # Checkpoint location inside container
-  checkpoint_location: "/opt/checkpoints/financial_txn"
+  checkpoint_location: "/opt/checkpoints/vehicle_telemetry"
   # Delta table output path
-  delta_output_path: "/opt/delta_output/financial_transactions"
+  delta_output_path: "/opt/delta_output/vehicle_telemetry"
   # Local-mode paths (for running outside Docker)
-  local_checkpoint: "./checkpoints/financial_txn"
-  local_delta_output: "./delta_output/financial_transactions"
+  local_checkpoint: "./checkpoints/vehicle_telemetry"
+  local_delta_output: "./delta_output/vehicle_telemetry"
   # Spark tuning
   shuffle_partitions: 8
   max_offsets_per_trigger: 500000
@@ -43,40 +48,38 @@ spark:
   # Cost model reference (USD / core-hour, Azure HDInsight D4v2 on-demand)
   cost_per_core_hour: 0.752
 
-accounts:
-  # Number of accounts in the fixed pool
-  num_accounts: 2048
-  # Checkpoint location for account upsert stream
-  checkpoint_location: "/opt/checkpoints/account_upsert"
-  local_checkpoint: "./checkpoints/account_upsert"
-  # Delta table paths for the accounts table
-  delta_output_path: "/opt/delta_output/accounts"
-  local_delta_output: "./delta_output/accounts"
+vehicle_state:
+  # Checkpoint location for the vehicle-state upsert stream
+  checkpoint_location: "/opt/checkpoints/vehicle_state"
+  local_checkpoint: "./checkpoints/vehicle_state"
+  # Delta table paths for the vehicle_state table (one row per VIN)
+  delta_output_path: "/opt/delta_output/vehicle_state"
+  local_delta_output: "./delta_output/vehicle_state"
 
 delta:
   # Default table path for viewer / cleanup (local mode)
-  table_path: "./delta_output/financial_transactions"
-  accounts_table_path: "./delta_output/accounts"
+  table_path: "./delta_output/vehicle_telemetry"
+  state_table_path: "./delta_output/vehicle_state"
   # Vacuum retention (hours) — files older than this are eligible for deletion
   vacuum_retention_hours: 168   # 7 days
   # Compact threshold — number of files before triggering compaction
   compact_threshold: 50
 
 rust:
-  consumer_group: "rust-financial-txn-consumer"
+  consumer_group: "rust-vehicle-telemetry-consumer"
   batch_size: 250000
   flush_interval_seconds: 3
-  delta_output_path: "/opt/delta_output/financial_transactions_rust"
-  local_delta_output: "./delta_output/financial_transactions_rust"
-  checkpoint_db: "/opt/checkpoints/rust_financial_txn/offsets.db"
-  local_checkpoint_db: "./checkpoints/rust_financial_txn/offsets.db"
-  accounts_delta_output_path: "/opt/delta_output/accounts_rust"
-  local_accounts_delta_output: "./delta_output/accounts_rust"
-  accounts_checkpoint_db: "/opt/checkpoints/rust_account_upsert/offsets.db"
-  local_accounts_checkpoint_db: "./checkpoints/rust_account_upsert/offsets.db"
-  accounts_consumer_group: "rust-account-upsert-consumer"
+  delta_output_path: "/opt/delta_output/vehicle_telemetry_rust"
+  local_delta_output: "./delta_output/vehicle_telemetry_rust"
+  checkpoint_db: "/opt/checkpoints/rust_vehicle_telemetry/offsets.db"
+  local_checkpoint_db: "./checkpoints/rust_vehicle_telemetry/offsets.db"
+  state_delta_output_path: "/opt/delta_output/vehicle_state_rust"
+  local_state_delta_output: "./delta_output/vehicle_state_rust"
+  state_checkpoint_db: "/opt/checkpoints/rust_vehicle_state/offsets.db"
+  local_state_checkpoint_db: "./checkpoints/rust_vehicle_state/offsets.db"
+  state_consumer_group: "rust-vehicle-state-consumer"
   metrics_file: "/opt/logs/rust_metrics.json"
-  accounts_metrics_file: "/opt/logs/rust_acct_metrics.json"
+  state_metrics_file: "/opt/logs/rust_state_metrics.json"
 
 logging:
   level: "INFO"

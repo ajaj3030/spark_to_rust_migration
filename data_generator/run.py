@@ -14,7 +14,7 @@ import sys
 import click
 import yaml
 
-from .generator import TransactionGenerator
+from .generator import TelemetryGenerator
 
 
 def _load_config(path: str) -> dict:
@@ -59,7 +59,7 @@ def _load_config(path: str) -> dict:
     help="Kafka topic name (overrides config).",
 )
 def main(config_path, target_gb, batch_size, threads, bootstrap_servers, topic):
-    """Generate financial transaction data and push to Kafka."""
+    """Generate synthetic vehicle telemetry and push to Kafka."""
     cfg = _load_config(config_path)
 
     # Configure logging
@@ -84,15 +84,14 @@ def main(config_path, target_gb, batch_size, threads, bootstrap_servers, topic):
     batch = batch_size or gen_cfg["batch_size"]
     n_threads = threads or gen_cfg["num_threads"]
 
-    account_topic = cfg["kafka"].get("account_topic", "account_updates")
-
-    generator = TransactionGenerator(
+    generator = TelemetryGenerator(
         bootstrap_servers=servers,
         topic=topic_name,
-        account_topic=account_topic,
+        state_topic=kafka_cfg["state_topic"],
         target_bytes=target_bytes,
         batch_size=batch,
         num_threads=n_threads,
+        num_vehicles=gen_cfg["num_vehicles"],
     )
 
     summary = generator.run()

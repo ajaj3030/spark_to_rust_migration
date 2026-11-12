@@ -1,14 +1,14 @@
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike, Weekday};
 
 pub struct TimeDimensions {
-    pub transaction_date: i32, // days since 1970-01-01 for Arrow Date32
-    pub txn_year: i32,
-    pub txn_month: i32,
-    pub txn_day: i32,
-    pub txn_hour: i32,
-    pub txn_dayofweek: i32, // Spark convention: 1=Sun, 7=Sat
+    pub event_date: i32, // days since 1970-01-01 for Arrow Date32
+    pub event_year: i32,
+    pub event_month: i32,
+    pub event_day: i32,
+    pub event_hour: i32,
+    pub event_dayofweek: i32, // Spark convention: 1=Sun, 7=Sat
     pub is_weekend: bool,
-    pub txn_quarter: i32,
+    pub event_quarter: i32,
     pub date_str: String, // "yyyy-MM-dd"
 }
 
@@ -23,14 +23,14 @@ pub fn apply(timestamp: &str) -> TimeDimensions {
     let dow = spark_dayofweek(date.weekday());
 
     TimeDimensions {
-        transaction_date: (date - *EPOCH).num_days() as i32,
-        txn_year: date.year(),
-        txn_month: date.month() as i32,
-        txn_day: date.day() as i32,
-        txn_hour: dt.hour() as i32,
-        txn_dayofweek: dow,
+        event_date: (date - *EPOCH).num_days() as i32,
+        event_year: date.year(),
+        event_month: date.month() as i32,
+        event_day: date.day() as i32,
+        event_hour: dt.hour() as i32,
+        event_dayofweek: dow,
         is_weekend: dow == 1 || dow == 7,
-        txn_quarter: ((date.month() - 1) / 3 + 1) as i32,
+        event_quarter: ((date.month() - 1) / 3 + 1) as i32,
         date_str: date.format("%Y-%m-%d").to_string(),
     }
 }

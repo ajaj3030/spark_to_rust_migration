@@ -1,4 +1,3 @@
-mod account;
 mod checkpoint;
 mod config;
 mod consumer;
@@ -6,6 +5,7 @@ mod metrics;
 mod schema;
 mod transforms;
 mod validate;
+mod vehicle_state;
 mod writer;
 
 use anyhow::Result;
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "rust-pipeline", about = "Rust Kafka→Delta pipeline for migration evaluation")]
+#[command(name = "rust-pipeline", about = "Rust Kafka→Delta vehicle telemetry pipeline (port of the Spark jobs)")]
 struct Cli {
     /// Path to app_config.yaml (shared with Spark)
     #[arg(short, long)]
@@ -26,19 +26,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run financial-transactions streaming pipeline
+    /// Run the vehicle-telemetry enrichment stream (port of streaming_job.py)
     Stream,
-    /// Run account-updates upsert pipeline
-    Upsert,
+    /// Run the vehicle-state MERGE stream (port of vehicle_state_job.py)
+    State,
     /// Validate Rust output against Spark output
     Validate {
         #[arg(long)]
         spark_path: Option<String>,
         #[arg(long)]
         rust_path: Option<String>,
-        /// Also validate account tables
+        /// Also validate the vehicle_state tables
         #[arg(long, default_value_t = false)]
-        accounts: bool,
+        state: bool,
     },
 }
 
@@ -53,22 +53,22 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Stream => {
-            tracing::info!("Starting financial-transactions streaming pipeline");
+            tracing::info!("Starting vehicle-telemetry streaming pipeline");
             consumer::run_streaming_pipeline(&cfg).await?;
         }
-        Command::Upsert => {
-            tracing::info!("Starting account-upsert pipeline");
-            account::run_account_upsert_pipeline(&cfg).await?;
+        Command::State => {
+            tracing::info!("Starting vehicle-state upsert pipeline");
+            vehicle_state::run_vehicle_state_pipeline(&cfg).await?;
         }
-        Command::Validate { spark_path, rust_path, accounts } => {
+        Command::Validate { spark_path, rust_path, state } => {
             let sp = spark_path.unwrap_or_else(|| cfg.delta_table_path());
             let rp = rust_path.unwrap_or_else(|| cfg.rust_delta_table_path());
             tracing::info!("Validating: spark={} rust={}", sp, rp);
             validate::run_validation(&sp, &rp).await?;
-            if accounts {
-                let sa = cfg.accounts_delta_path();
-                let ra = cfg.rust_accounts_delta_path();
-                tracing::info!("Validating accounts: spark={} rust={}", sa, ra);
+            if state {
+                let sa = cfg.state_delta_path();
+                let ra = cfg.rust_state_delta_path();
+                tracing::info!("Validating vehicle_state: spark={} rust={}", sa, ra);
                 validate::run_validation(&sa, &ra).await?;
             }
         }

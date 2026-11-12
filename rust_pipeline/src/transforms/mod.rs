@@ -1,112 +1,85 @@
-pub mod null_handling;
-pub mod time_dimensions;
-pub mod amount_features;
-pub mod risk_features;
-pub mod geo_features;
 pub mod anonymized;
-pub mod session_features;
+pub mod battery_features;
+pub mod event_features;
+pub mod health_features;
+pub mod location_features;
+pub mod null_handling;
+pub mod rounding;
+pub mod time_dimensions;
 
-use crate::schema::{KafkaMeta, TransactionInput, TransactionOutput};
+use crate::schema::{KafkaMeta, TelemetryInput, TelemetryOutput};
 
 /// Apply all 7 transforms in order, matching Spark's apply_all_transforms.
-pub fn apply_all_transforms(input: &TransactionInput, meta: &KafkaMeta) -> TransactionOutput {
-    // T1: Null handling
-    let nh = null_handling::apply(input);
-    // T2: Time dimensions
-    let td = time_dimensions::apply(&input.timestamp);
-    // T3: Amount features
-    let af = amount_features::apply(input.amount, nh.fee, nh.exchange_rate);
-    // T4: Risk features
-    let rf = risk_features::apply(input.risk_score, input.is_flagged, input.amount);
-    // T5: Geo features
-    let gf = geo_features::apply(
-        &nh.sender_country, &nh.receiver_country,
-        &input.sender_bank_code, &input.receiver_bank_code,
-    );
-    // T6: Anonymized columns
-    let anon = anonymized::apply(
-        &input.sender_name, &input.receiver_name,
-        &input.sender_account, &input.receiver_account,
-        &input.ip_address,
-    );
-    // T7: Session features
-    let sf = session_features::apply(
-        &input.device_fingerprint, &input.session_id,
-        &input.memo, &input.transaction_id,
-    );
+pub fn apply_all_transforms(input: &TelemetryInput, meta: &KafkaMeta) -> TelemetryOutput {
+    let nh = null_handling::apply(input); // T1
+    let td = time_dimensions::apply(&input.event_time); // T2
+    let bf = battery_features::apply(input); // T3
+    let hf = health_features::apply(input, bf.cell_temp_spread); // T4 (uses T3)
+    let loc = location_features::apply(input.latitude, input.longitude); // T5
+    let anon = anonymized::apply(&input.vin); // T6
+    let ev = event_features::apply(&input.event_id, &nh.software_version_safe); // T7
 
-    TransactionOutput {
-        kafka_key: meta.key.clone(),
-        transaction_id: input.transaction_id.clone(),
-        timestamp: input.timestamp.clone(),
-        sender_account_id: input.sender_account_id.clone(),
-        receiver_account_id: input.receiver_account_id.clone(),
-        sender_account: input.sender_account.clone(),
-        receiver_account: input.receiver_account.clone(),
-        amount: input.amount,
-        currency: input.currency.clone(),
-        transaction_type: input.transaction_type.clone(),
-        status: input.status.clone(),
-        sender_name: input.sender_name.clone(),
-        receiver_name: input.receiver_name.clone(),
-        sender_bank_code: input.sender_bank_code.clone(),
-        receiver_bank_code: input.receiver_bank_code.clone(),
-        sender_country: nh.sender_country,
-        receiver_country: nh.receiver_country,
-        fee: nh.fee,
-        exchange_rate: nh.exchange_rate,
-        reference_id: input.reference_id.clone(),
-        memo: input.memo.clone(),
-        risk_score: input.risk_score,
-        is_flagged: input.is_flagged,
-        category: input.category.clone(),
-        channel: input.channel.clone(),
-        ip_address: input.ip_address.clone(),
-        device_fingerprint: input.device_fingerprint.clone(),
-        session_id: input.session_id.clone(),
+    TelemetryOutput {
+        event_id: input.event_id.clone(),
+        event_type: input.event_type.clone(),
+        event_time: input.event_time.clone(),
+        sequence_number: input.sequence_number,
+        model: input.model.clone(),
+        model_variant: input.model_variant.clone(),
+        software_version: input.software_version.clone(),
+        power_state: input.power_state.clone(),
+        odometer_km: nh.odometer_km,
+        charge_percent: input.charge_percent,
+        remaining_range: input.remaining_range,
+        kwhr: input.kwhr,
+        capacity_kwhr: input.capacity_kwhr,
+        battery_health_level: input.battery_health_level,
+        max_cell_temp: input.max_cell_temp,
+        min_cell_temp: input.min_cell_temp,
+        preconditioning_status: input.preconditioning_status.clone(),
+        battery_pack_type: input.battery_pack_type.clone(),
+        charge_state: input.charge_state.clone(),
+        charge_session_id: input.charge_session_id.clone(),
+        charging_power_kw: input.charging_power_kw,
+        energy_added_kwh: input.energy_added_kwh,
+        ecu: input.ecu.clone(),
+        dtc_code: input.dtc_code.clone(),
+        warning_state: input.warning_state.clone(),
+        update_state: input.update_state.clone(),
+        target_software_version: input.target_software_version.clone(),
+        update_progress_percent: input.update_progress_percent,
         topic: meta.topic.clone(),
         kafka_partition: meta.partition,
         kafka_offset: meta.offset,
         kafka_timestamp: meta.timestamp_ms,
-        // T1
-        currency_safe: nh.currency_safe,
-        risk_score_safe: nh.risk_score_safe,
-        memo_clean: nh.memo_clean,
-        // T2
-        transaction_date: td.transaction_date,
-        txn_year: td.txn_year,
-        txn_month: td.txn_month,
-        txn_day: td.txn_day,
-        txn_hour: td.txn_hour,
-        txn_dayofweek: td.txn_dayofweek,
+        model_safe: nh.model_safe,
+        software_version_safe: nh.software_version_safe,
+        power_state_safe: nh.power_state_safe,
+        event_date: td.event_date,
+        event_year: td.event_year,
+        event_month: td.event_month,
+        event_day: td.event_day,
+        event_hour: td.event_hour,
+        event_dayofweek: td.event_dayofweek,
         is_weekend: td.is_weekend,
-        txn_quarter: td.txn_quarter,
+        event_quarter: td.event_quarter,
         date_str: td.date_str,
-        // T3
-        amount_bucket: af.amount_bucket,
-        net_amount: af.net_amount,
-        fee_pct: af.fee_pct,
-        amount_usd: af.amount_usd,
-        log_amount: af.log_amount,
-        // T4
-        risk_tier: rf.risk_tier,
-        risk_level: rf.risk_level,
-        needs_review: rf.needs_review,
-        // T5
-        is_cross_border: gf.is_cross_border,
-        corridor: gf.corridor,
-        is_intra_bank: gf.is_intra_bank,
-        // T6
-        sender_hash: anon.sender_hash,
-        receiver_hash: anon.receiver_hash,
-        sender_account_masked: anon.sender_account_masked,
-        receiver_account_masked: anon.receiver_account_masked,
-        ip_anonymized: anon.ip_anonymized,
-        // T7
-        device_short_id: sf.device_short_id,
-        session_prefix: sf.session_prefix,
-        memo_length: sf.memo_length,
-        has_memo: sf.has_memo,
-        row_id: sf.row_id,
+        soc_bucket: bf.soc_bucket,
+        energy_pct: bf.energy_pct,
+        cell_temp_spread: bf.cell_temp_spread,
+        degradation_pct: bf.degradation_pct,
+        km_per_percent: bf.km_per_percent,
+        health_tier: hf.health_tier,
+        thermal_alert: hf.thermal_alert,
+        is_fault: hf.is_fault,
+        needs_service: hf.needs_service,
+        severity_level: hf.severity_level,
+        lat_coarse: loc.lat_coarse,
+        lon_coarse: loc.lon_coarse,
+        vin_hash: anon.vin_hash,
+        vin_wmi: anon.vin_wmi,
+        row_id: ev.row_id,
+        sw_major: ev.sw_major,
+        sw_minor: ev.sw_minor,
     }
 }
