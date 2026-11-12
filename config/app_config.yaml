@@ -56,6 +56,11 @@ vehicle_state:
   delta_output_path: "/opt/delta_output/vehicle_state"
   local_delta_output: "./delta_output/vehicle_state"
 
+analytics:
+  # Batch analytics jobs (spark_jobs/analytics/) write one Delta table each under here
+  output_base: "/opt/delta_output/analytics"
+  local_output_base: "./delta_output/analytics"
+
 delta:
   # Default table path for viewer / cleanup (local mode)
   table_path: "./delta_output/vehicle_telemetry"

@@ -6,8 +6,8 @@ Structured Streaming to Rust stream processors. Synthetic EV telemetry
 keyed by VIN, into Delta Lake tables that downstream service, warranty and
 OTA systems read.
 
-Two jobs are already ported to Rust and proven equivalent by a parity
-check. The batch analytics jobs are still Spark-only.
+Two streaming jobs are already ported to Rust and proven equivalent by a
+parity check. Four batch analytics jobs are still Spark-only.
 
 ## Provenance
 
@@ -42,7 +42,35 @@ rust-pipeline validate  ──  compares each Spark table with its Rust twin (th
 |---|---|---|---|
 | Telemetry enrichment (`streaming_job.py`) | ✅ | ✅ `rust-pipeline stream` | `validate` |
 | Vehicle state MERGE (`vehicle_state_job.py`) | ✅ | ✅ `rust-pipeline state` | `validate --state` |
-| Batch analytics (`batch_analytics_job.py`) | still finance-schema; being converted | ❌ not ported | — |
+| Battery health daily (`analytics/battery_health_daily.py`) | ✅ | ❌ | — |
+| Charging sessions (`analytics/charging_sessions.py`) | ✅ | ❌ | — |
+| OTA rollout (`analytics/ota_rollout.py`) | ✅ | ❌ | — |
+| Diagnostic alerts (`analytics/diagnostic_alerts.py`) | ✅ | ❌ | — |
+
+## Batch analytics jobs
+
+Each job in `spark_jobs/analytics/` is independent: it reads the enriched
+telemetry table (diagnostic_alerts also reads `vehicle_state`), computes one
+summary in a pure `summarize(...)` function, and overwrites one Delta table
+under `delta_output/analytics/<job>`. Each module's docstring lists the
+behaviour a port must preserve.
+
+| Job | Output key | What it answers |
+|---|---|---|
+| `battery_health_daily` | vin_hash, event_date | Daily battery summary, 3-day peak cell temperature, day-over-day health change |
+| `charging_sessions` | charge_session_id | Session duration, energy, peak/average power, start/end SoC, end state, faults |
+| `ota_rollout` | target_software_version, model | Latest update state per vehicle, pivoted; success and failure rates |
+| `diagnostic_alerts` | dtc_code, ecu, model, battery_pack_type | Vehicles affected per trouble code, share of fleet, rank within ECU |
+
+```bash
+JARS=$(docker exec spark-master bash -c 'ls /opt/extra-jars/*.jar | paste -sd, -')
+docker exec -w /opt spark-master /opt/spark/bin/spark-submit --master spark://spark-master:7077 \
+  --jars $JARS --py-files /opt/spark-jobs/analytics/common.py \
+  /opt/spark-jobs/analytics/charging_sessions.py --config /opt/config/app_config.yaml
+```
+
+Run after the streaming jobs have written `vehicle_telemetry` and
+`vehicle_state`.
 
 ## Guarantees the pipeline relies on
 
@@ -144,7 +172,7 @@ coarsening · T6 VIN pseudonymisation · T7 `row_id`, `sw_major`, `sw_minor`.
 
 ## Not yet updated for telemetry
 
-`dashboard/`, `delta_viewer/`, `cleanup/` and
+`dashboard/`, `delta_viewer/`, `cleanup/`, `spark_jobs/metrics_bridge.py` and
 `scripts/generate_pipeline_report.py` still assume the original
 financial-transactions schema.
 

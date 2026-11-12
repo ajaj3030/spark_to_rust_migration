@@ -67,6 +67,7 @@ def _next_software_version(current: str) -> str:
 # ── Event builders: each fills one group of fields ────────────
 
 def _battery_fields(v: Vehicle, rng: random.Random) -> dict:
+    v.battery_health_level = round(max(60.0, v.battery_health_level - rng.uniform(0, 0.05)), 2)
     v.charge_percent = round(min(100.0, max(1.0, v.charge_percent - rng.uniform(0, 1.5))), 1)
     min_temp = round(rng.uniform(15.0, 35.0), 1)
     spread = rng.uniform(25.0, 30.0) if rng.random() < THERMAL_SPIKE_PROBABILITY else rng.uniform(0.5, 6.0)
@@ -142,12 +143,14 @@ POWER_STATE_FOR_EVENT = {
 def _advance_vehicle(v: Vehicle, rng: random.Random, now: datetime) -> None:
     """Move the vehicle's clock, odometer and position forward."""
     if v.clock is None:
-        v.clock = now - timedelta(hours=24) + timedelta(seconds=rng.randint(0, 3600))
+        v.clock = now - timedelta(days=7) + timedelta(seconds=rng.randint(0, 3600))
         v.first_seen_at = _iso(v.clock)
         # Real vehicles keep counting across reconnects; derive the starting
         # sequence from wall-clock time so a re-run continues past earlier runs.
         v.sequence_number = int(now.timestamp()) * 1_000_000
-    v.clock += timedelta(seconds=rng.randint(1, 120))
+    # Vehicles report every few minutes to a couple of hours, so a modest run
+    # spans several days (exercises the daily and multi-day analytics)
+    v.clock += timedelta(seconds=rng.randint(60, 2 * 3600))
     v.sequence_number += 1
     if v.power_state == "POWER_STATE_DRIVE":
         v.odometer_km = round(v.odometer_km + rng.uniform(0.1, 3.0), 1)
