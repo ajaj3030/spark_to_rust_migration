@@ -62,7 +62,7 @@ analytics:
   local_output_base: "./delta_output/analytics"
 
 delta:
-  # Default table path for viewer / cleanup (local mode)
+  # Local-mode table paths
   table_path: "./delta_output/vehicle_telemetry"
   state_table_path: "./delta_output/vehicle_state"
   # Vacuum retention (hours) — files older than this are eligible for deletion

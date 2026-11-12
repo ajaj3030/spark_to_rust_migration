@@ -1,0 +1,74 @@
+# Telemetry enrichment: Kafka vehicle_telemetry -> Delta vehicle_telemetry_rust
+#
+# One replica with the Recreate strategy: the processor assigns every Kafka
+# partition to itself and resumes from its own checkpointed offsets, so two
+# pods must never consume at once (that would break per-VIN ordering and
+# write duplicates). Scale by adding partitions per processor, not replicas.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telemetry-stream
+  labels:
+    app.kubernetes.io/name: telemetry-stream
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: telemetry-stream
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: telemetry-stream
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: rust-pipeline
+          image: rust-pipeline
+          args: ["--config", "/opt/config/app_config.yaml", "stream"]
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /opt/config
+              readOnly: true
+            - name: data
+              mountPath: /opt/delta_output
+              subPath: delta_output
+            - name: data
+              mountPath: /opt/checkpoints
+              subPath: checkpoints
+            - name: data
+              mountPath: /opt/logs
+              subPath: logs
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: rust-pipeline-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: telemetry-stream-data
+        - name: tmp
+          emptyDir: {}

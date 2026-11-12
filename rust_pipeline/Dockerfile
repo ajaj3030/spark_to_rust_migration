@@ -1,5 +1,5 @@
 # ── Builder stage ──────────────────────────────────────────────
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:1.91-slim-bookworm AS builder
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
@@ -18,7 +18,7 @@ RUN touch src/main.rs && cargo build --release
 # ── Runtime stage ─────────────────────────────────────────────
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
-    libssl3 libsasl2-2 ca-certificates sqlite3 procps \
+    libssl3 libsasl2-2 libcurl4 libzstd1 ca-certificates sqlite3 procps \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/rust-pipeline /usr/local/bin/rust-pipeline

@@ -41,7 +41,6 @@ Thumbs.db
 # Logs
 *.log
 logs/*
-!logs/*.html
 *.duckdb
 *.duckdb.wal
 
@@ -60,3 +59,4 @@ img.txt
 
 # Parity fixtures for the Rust analytics ports are small and must be committed
 !rust_pipeline/tests/fixtures/**/*.parquet
+.bsp/

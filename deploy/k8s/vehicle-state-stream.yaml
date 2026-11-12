@@ -1,0 +1,74 @@
+# Vehicle state MERGE: Kafka vehicle_state_updates -> Delta vehicle_state_rust
+#
+# One replica with the Recreate strategy: the processor assigns every Kafka
+# partition to itself and resumes from its own checkpointed offsets, so two
+# pods must never consume at once (that would break per-VIN ordering and
+# write duplicates). Scale by adding partitions per processor, not replicas.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vehicle-state-stream
+  labels:
+    app.kubernetes.io/name: vehicle-state-stream
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vehicle-state-stream
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vehicle-state-stream
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: rust-pipeline
+          image: rust-pipeline
+          args: ["--config", "/opt/config/app_config.yaml", "state"]
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /opt/config
+              readOnly: true
+            - name: data
+              mountPath: /opt/delta_output
+              subPath: delta_output
+            - name: data
+              mountPath: /opt/checkpoints
+              subPath: checkpoints
+            - name: data
+              mountPath: /opt/logs
+              subPath: logs
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: rust-pipeline-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: vehicle-state-stream-data
+        - name: tmp
+          emptyDir: {}

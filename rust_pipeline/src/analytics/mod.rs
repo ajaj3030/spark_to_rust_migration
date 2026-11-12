@@ -1,4 +1,4 @@
-//! Rust ports of the batch analytics jobs in spark_jobs/analytics/.
+//! Rust ports of the Scala Spark batch analytics jobs in spark_jobs/analytics/.
 //!
 //! Each job lives in its own file and exposes:
 //!   - `JOB`: its name and output key columns

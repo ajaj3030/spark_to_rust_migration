@@ -46,3 +46,44 @@ jobs:
       - run: pip install ruff==0.17.5
       - name: Syntax errors and undefined or unused names
         run: ruff check spark_jobs data_generator dashboard --select E9,F
+
+  scala:
+    name: Scala Spark jobs — compile
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: spark_jobs/analytics
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: sbt
+      - uses: sbt/setup-sbt@v1
+      - name: Compile and package (warnings are errors)
+        run: sbt -batch package
+
+  kubernetes:
+    name: Kubernetes manifests — validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render with kustomize and validate against the Kubernetes schemas
+        run: kubectl kustomize deploy/k8s | docker run --rm -i ghcr.io/yannh/kubeconform:v0.6.7 -strict -summary -
+
+  image:
+    name: Container image — build
+    # Release builds are slow; build the image on main only
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: rust_pipeline
+          tags: rust-pipeline:${{ github.sha }}
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

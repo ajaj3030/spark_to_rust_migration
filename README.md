@@ -1,13 +1,15 @@
 # Vehicle Telemetry Pipeline — Spark → Rust Migration
 
 A vehicle-to-cloud telemetry pipeline midway through a migration from Spark
-Structured Streaming to Rust stream processors. Synthetic EV telemetry
-(battery, charging, diagnostics, OTA update status) flows through Kafka,
-keyed by VIN, into Delta Lake tables that downstream service, warranty and
-OTA systems read.
+to Rust stream processors on Kubernetes. Synthetic EV telemetry (battery,
+charging, diagnostics, OTA update status) flows through Kafka, keyed by VIN,
+into Delta Lake tables that downstream service, warranty and OTA systems
+read.
 
-Two streaming jobs are already ported to Rust and proven equivalent by a
-parity check. Four batch analytics jobs are still Spark-only.
+The ingestion streams are already ported to Rust, deployed with the
+manifests in `deploy/k8s/`, and proven equivalent by a parity check. The
+four Scala Spark jobs that build the battery, charging, OTA and diagnostics
+tables are not ported yet.
 
 ## Provenance
 
@@ -33,6 +35,9 @@ data_generator ──► Kafka ─┬─ vehicle_telemetry (key = VIN) ─┬─
                                                              ├─► Spark  vehicle_state_job.py ─► delta_output/vehicle_state
                                                              └─► Rust   rust-pipeline state  ─► delta_output/vehicle_state_rust
 
+Scala Spark analytics (spark_jobs/analytics) ─► delta_output/analytics/<job>        battery, charging, OTA, diagnostics
+Rust ports (rust_pipeline/src/analytics)    ─► delta_output/analytics/<job>_rust   not ported yet
+
 rust-pipeline validate  ──  compares each Spark table with its Rust twin (the migration acceptance gate)
 ```
 
@@ -42,18 +47,18 @@ rust-pipeline validate  ──  compares each Spark table with its Rust twin (th
 |---|---|---|---|
 | Telemetry enrichment (`streaming_job.py`) | ✅ | ✅ `rust-pipeline stream` | `validate` |
 | Vehicle state MERGE (`vehicle_state_job.py`) | ✅ | ✅ `rust-pipeline state` | `validate --state` |
-| Batch analytics (`analytics/*.py`, 4 jobs) | ✅ | one file per job in `rust_pipeline/src/analytics/` | parity test per job |
+| Battery health, charging sessions, OTA rollout, diagnostic alerts (Scala) | ✅ | not ported | parity test per job |
 
-An analytics job is ported once its parity test is no longer `#[ignore]`d;
-the dashboard's Migration page shows each job's status live.
+Each analytics job has a placeholder in `rust_pipeline/src/analytics/<job>.rs`
+whose parity test stays `#[ignore]`d until the job is ported. The
+dashboard's Migration page shows each job's status live.
 
 ## Batch analytics jobs
 
-Each job in `spark_jobs/analytics/` is independent: it reads the enriched
-telemetry table (diagnostic_alerts also reads `vehicle_state`), computes one
-summary in a pure `summarize(...)` function, and overwrites one Delta table
-under `delta_output/analytics/<job>`. Each module's docstring lists the
-behaviour a port must preserve.
+Scala (Spark 3.5, Scala 2.12) in `spark_jobs/analytics/`, one object per
+job. Each reads the enriched telemetry table (diagnostic_alerts also reads
+`vehicle_state`), computes one summary in a pure `summarize` function, and
+overwrites one Delta table under `delta_output/analytics/<job>`.
 
 | Job | Output key | What it answers |
 |---|---|---|
@@ -63,14 +68,17 @@ behaviour a port must preserve.
 | `diagnostic_alerts` | dtc_code, ecu, model, battery_pack_type | Vehicles affected per trouble code, share of fleet, rank within ECU |
 
 ```bash
+# Build the jar (sbt in Docker, nothing to install locally)
+docker run --rm -v "$PWD/spark_jobs/analytics":/build -w /build \
+  sbtscala/scala-sbt:eclipse-temurin-11.0.17_8_1.8.2_2.12.17 sbt -batch package
+
+# Run a job on the cluster, after the streaming jobs have written their tables
 JARS=$(docker exec spark-master bash -c 'ls /opt/extra-jars/*.jar | paste -sd, -')
 docker exec -w /opt spark-master /opt/spark/bin/spark-submit --master spark://spark-master:7077 \
-  --jars $JARS --py-files /opt/spark-jobs/analytics/common.py \
-  /opt/spark-jobs/analytics/charging_sessions.py --config /opt/config/app_config.yaml
+  --jars $JARS --class telemetry.analytics.ChargingSessions \
+  /opt/spark-jobs/analytics/target/scala-2.12/telemetry-analytics_2.12-1.0.0.jar \
+  --config /opt/config/app_config.yaml
 ```
-
-Run after the streaming jobs have written `vehicle_telemetry` and
-`vehicle_state`.
 
 ## Guarantees the pipeline relies on
 
@@ -103,14 +111,16 @@ jobs it also requires exactly Spark's column names and types — the
 contract downstream readers depend on.
 
 **In CI (no Kafka or Spark needed).** `rust_pipeline/tests/fixtures/` holds
-a fixed slice of real pipeline output (150 vehicles) and Spark's output for
-each analytics job on that slice. Each job's parity test runs the Rust port
-on the same input and compares. Regenerate fixtures only when a Spark job
-changes:
+a fixed slice of real pipeline output (150 vehicles) and the Scala jobs'
+output on that slice. Each job's parity test runs the Rust port on the same
+input and compares. Regenerate the expected outputs only when a Spark job
+changes (drop `--expected-only` to also resample the input):
 
 ```bash
-docker exec -w /opt spark-master /opt/spark/bin/spark-submit --jars $JARS \
-  /opt/spark-jobs/analytics/build_parity_fixtures.py --local --config /opt/config/app_config.yaml
+docker exec -w /opt spark-master /opt/spark/bin/spark-submit --master 'local[*]' --jars $JARS \
+  --class telemetry.analytics.BuildParityFixtures \
+  /opt/spark-jobs/analytics/target/scala-2.12/telemetry-analytics_2.12-1.0.0.jar \
+  --local --expected-only --out /opt/rust_pipeline/tests/fixtures --config /opt/config/app_config.yaml
 ```
 
 **Against live tables.**
@@ -123,28 +133,19 @@ rust-pipeline --config config/app_config.yaml validate --job charging_sessions
 
 Reports go to `logs/validation_report_<table>.json`; FAIL exits non-zero.
 
-## Porting an analytics job
+## Deployment
 
-Everything a port touches is in its own file,
-`rust_pipeline/src/analytics/<job>.rs` (registry, dispatcher and CLI are
-already wired), so several jobs can be ported in parallel without
-conflicts. Done means:
-
-1. `summarize` reproduces `spark_jobs/analytics/<job>.py` in DataFusion,
-   reading the registered `telemetry` / `vehicle_state` tables
-2. the `#[ignore]` is removed from the job's parity test
-3. CI is green: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-   `cargo test`
-
-A port changes only that job's file, so parallel ports never conflict.
-
-Rust reproduces Spark's `round()` exactly (`transforms/rounding.rs`): Spark
-rounds HALF_UP on the decimal form of the double, so `round(1.005, 2)` is
-1.01, where naive float rounding gives 1.0.
+`deploy/k8s/` deploys the Rust stream processors with kustomize
+(`kubectl apply -k deploy/k8s`): one Deployment per processor, an in-cluster
+config, and a volume per processor for its Delta output and Kafka offsets.
+Each processor runs as a single replica with the `Recreate` strategy, because
+it assigns itself every partition and resumes from its own checkpoint; two
+pods consuming at once would break per-VIN ordering.
 
 ## Quick start
 
-Prerequisites: Docker, Rust (`rustup`), cmake, Python 3.10+.
+Prerequisites: Docker, Rust (`rustup`), cmake, Python 3.10+. The Scala
+jobs build in Docker (see Batch analytics jobs).
 
 ```bash
 # 1. Python env for the generator
@@ -175,15 +176,19 @@ docker exec -d -w /opt spark-master bash -c "/opt/spark/bin/spark-submit --maste
 
 # 7. Once both sides have processed the data
 ./rust_pipeline/target/debug/rust-pipeline --config config/app_config.yaml validate --state
+
+# 8. Scala analytics jobs (build the jar first, see Batch analytics jobs)
 ```
 
 Tests, including the analytics parity tests: `(cd rust_pipeline && CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo test)`.
-CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests for Rust, and
-ruff for the Python code, on every push and pull request.
+CI (`.github/workflows/ci.yml`) runs on every push and pull request: Rust
+fmt, clippy and tests; ruff for the Python code; an sbt build of the Scala
+jobs; and kustomize + kubeconform on the Kubernetes manifests. Pushes to
+`main` also build the container image.
 
 ## Dashboard
 
-Steps 4–7 can also be driven from the Streamlit dashboard:
+Steps 4–8 can also be driven from the Streamlit dashboard:
 
 ```bash
 .venv/bin/streamlit run dashboard/app.py   # http://localhost:8501
@@ -226,12 +231,6 @@ T3 battery metrics (`soc_bucket`, `energy_pct`, `cell_temp_spread`,
 `degradation_pct`, `km_per_percent`) · T4 health flags (`health_tier`,
 `thermal_alert`, `is_fault`, `needs_service`, `severity_level`) · T5 GPS
 coarsening · T6 VIN pseudonymisation · T7 `row_id`, `sw_major`, `sw_minor`.
-
-## Not yet updated for telemetry
-
-`delta_viewer/`, `cleanup/`, `spark_jobs/metrics_bridge.py` and
-`scripts/generate_pipeline_report.py` still assume the original
-financial-transactions schema.
 
 ## License
 

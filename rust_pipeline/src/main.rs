@@ -34,7 +34,7 @@ enum Command {
     Stream,
     /// Run the vehicle-state MERGE stream (port of vehicle_state_job.py)
     State,
-    /// Run one ported batch analytics job (port of spark_jobs/analytics/<job>.py)
+    /// Run one ported batch analytics job (port of a Scala job in spark_jobs/analytics/)
     Analytics {
         /// battery_health_daily | charging_sessions | ota_rollout | diagnostic_alerts
         job: String,

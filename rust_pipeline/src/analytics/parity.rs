@@ -1,7 +1,7 @@
 //! Test helper: run a job on the committed fixtures and compare its output
 //! with what Spark produced from the same input.
 //!
-//! Fixtures (regenerate with spark_jobs/analytics/build_parity_fixtures.py):
+//! Fixtures (regenerate with the BuildParityFixtures Spark job):
 //!   tests/fixtures/input/telemetry       enriched telemetry, ~150 vehicles
 //!   tests/fixtures/input/vehicle_state   matching vehicle_state rows
 //!   tests/fixtures/expected/<job>        Spark's output for each job

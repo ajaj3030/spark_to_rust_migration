@@ -1,0 +1,35 @@
+# In-cluster configuration for the Rust pipeline. Mounted at
+# /opt/config/app_config.yaml, which makes it use the /opt paths and
+# internal_bootstrap_servers (see rust_pipeline/src/config.rs).
+kafka:
+  bootstrap_servers: "kafka-bootstrap.kafka.svc:9092"
+  internal_bootstrap_servers: "kafka-bootstrap.kafka.svc:9092"
+  topic: "vehicle_telemetry"
+  state_topic: "vehicle_state_updates"
+  partitions: 8
+
+spark:
+  delta_output_path: "/opt/delta_output/vehicle_telemetry"
+
+vehicle_state:
+  delta_output_path: "/opt/delta_output/vehicle_state"
+
+delta:
+  table_path: "/opt/delta_output/vehicle_telemetry"
+  state_table_path: "/opt/delta_output/vehicle_state"
+
+analytics:
+  output_base: "/opt/delta_output/analytics"
+  local_output_base: "/opt/delta_output/analytics"
+
+rust:
+  consumer_group: "rust-vehicle-telemetry-consumer"
+  state_consumer_group: "rust-vehicle-state-consumer"
+  batch_size: 250000
+  flush_interval_seconds: 3
+  delta_output_path: "/opt/delta_output/vehicle_telemetry_rust"
+  checkpoint_db: "/opt/checkpoints/rust_vehicle_telemetry/offsets.db"
+  state_delta_output_path: "/opt/delta_output/vehicle_state_rust"
+  state_checkpoint_db: "/opt/checkpoints/rust_vehicle_state/offsets.db"
+  metrics_file: "/opt/logs/rust_metrics.json"
+  state_metrics_file: "/opt/logs/rust_state_metrics.json"

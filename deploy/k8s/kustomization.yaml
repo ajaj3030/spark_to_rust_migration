@@ -1,0 +1,27 @@
+# Rust stream processors for the vehicle telemetry pipeline.
+#   kubectl apply -k deploy/k8s
+# Point `images` at your registry; CI builds the image from rust_pipeline/Dockerfile.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: vehicle-telemetry
+
+resources:
+  - namespace.yaml
+  - storage.yaml
+  - telemetry-stream.yaml
+  - vehicle-state-stream.yaml
+
+configMapGenerator:
+  - name: rust-pipeline-config
+    files:
+      - app_config.yaml
+
+images:
+  - name: rust-pipeline
+    newTag: "1.0.0"
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: vehicle-telemetry
+    includeSelectors: false

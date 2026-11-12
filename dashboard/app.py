@@ -178,24 +178,28 @@ cfg = load_config()
 ANALYTICS_JOBS = [
     {
         "name": "battery_health_daily",
+        "class": "BatteryHealthDaily",
         "title": "Battery health (daily)",
         "desc": "Per vehicle per day: charge, cell temperatures, thermal alerts, "
                 "end-of-day battery health and its day-over-day change.",
     },
     {
         "name": "charging_sessions",
+        "class": "ChargingSessions",
         "title": "Charging sessions",
         "desc": "One row per charge session: duration, energy added, peak and "
                 "average power, start/end state of charge, faults.",
     },
     {
         "name": "ota_rollout",
+        "class": "OtaRollout",
         "title": "OTA rollout",
         "desc": "Latest OTA update state per vehicle, pivoted by target software "
                 "version and model, with success and failure rates.",
     },
     {
         "name": "diagnostic_alerts",
+        "class": "DiagnosticAlerts",
         "title": "Diagnostic alerts",
         "desc": "Fault codes (DTCs) by ECU, model and battery pack: events, "
                 "vehicles affected, share of fleet, rank within ECU.",
@@ -237,6 +241,11 @@ SPARK_CORES_PER_JOB = 2
 _SPARK_APP = cfg["spark"]["app_name"]
 
 
+# Built with sbt package in spark_jobs/analytics (see README)
+ANALYTICS_JAR = "spark_jobs/analytics/target/scala-2.12/telemetry-analytics_2.12-1.0.0.jar"
+ANALYTICS_JAR_IN_CONTAINER = "/opt/spark-jobs/analytics/target/scala-2.12/telemetry-analytics_2.12-1.0.0.jar"
+
+
 def _build_spark_jobs() -> dict:
     jobs = {
         "spark_telemetry": {
@@ -244,8 +253,8 @@ def _build_spark_jobs() -> dict:
             "desc": "Reads vehicle telemetry from Kafka, applies the enrichment chain "
                     "(battery and health features, coarse location, VIN hashing) and "
                     "appends to the vehicle_telemetry table. Runs until stopped.",
-            "script": "/opt/spark-jobs/streaming_job.py",
-            "py_files": ["/opt/spark-jobs/transforms.py"],
+            "app": ["--py-files", "/opt/spark-jobs/transforms.py", "/opt/spark-jobs/streaming_job.py"],
+            "process": "streaming_job.py",
             "app_name": _SPARK_APP,
             "metrics_file": "spark_stream_metrics.json",
             "long_running": True,
@@ -255,8 +264,9 @@ def _build_spark_jobs() -> dict:
             "desc": "Reads per-vehicle state snapshots and MERGEs them into the "
                     "vehicle_state table (one row per VIN; older sequence numbers never "
                     "overwrite newer state). Runs until stopped.",
-            "script": "/opt/spark-jobs/vehicle_state_job.py",
-            "py_files": ["/opt/extra-jars/delta-spark_2.12-3.1.0.jar"],
+            "app": ["--py-files", "/opt/extra-jars/delta-spark_2.12-3.1.0.jar",
+                    "/opt/spark-jobs/vehicle_state_job.py"],
+            "process": "vehicle_state_job.py",
             "app_name": f"{_SPARK_APP}_VehicleState",
             "metrics_file": "spark_state_metrics.json",
             "long_running": True,
@@ -265,9 +275,9 @@ def _build_spark_jobs() -> dict:
     for job in ANALYTICS_JOBS:
         jobs[f"spark_{job['name']}"] = {
             "title": f"📊 {job['title']}",
-            "desc": job["desc"] + " Batch job over the telemetry table.",
-            "script": f"/opt/spark-jobs/analytics/{job['name']}.py",
-            "py_files": ["/opt/spark-jobs/analytics/common.py"],
+            "desc": job["desc"] + " Scala batch job over the telemetry table.",
+            "app": ["--class", f"telemetry.analytics.{job['class']}", ANALYTICS_JAR_IN_CONTAINER],
+            "process": f"telemetry.analytics.{job['class']}",
             "app_name": f"{_SPARK_APP}_{job['name']}",
             "metrics_file": None,
             "long_running": False,
@@ -332,8 +342,7 @@ def spark_submit_command(job: dict) -> list[str]:
         "--master", "spark://spark-master:7077",
         "--total-executor-cores", str(SPARK_CORES_PER_JOB),
         "--jars", ",".join(f"/opt/extra-jars/{jar}" for jar in SPARK_JARS),
-        "--py-files", ",".join(job["py_files"]),
-        job["script"],
+        *job["app"],
         "--config", "/opt/config/app_config.yaml",
     ]
 
@@ -400,8 +409,7 @@ def stop_spark_job(key: str):
                 requests.post(f"http://{spark_host}:8080/app/kill/?id={app['id']}&terminate=true", timeout=5)
             except requests.RequestException as e:
                 st.warning(f"Could not kill Spark app {app['id']}: {e}")
-    script_name = job["script"].split("/")[-1]
-    subprocess.run(["docker", "exec", "spark-master", "pkill", "-f", script_name],
+    subprocess.run(["docker", "exec", "spark-master", "pkill", "-f", job["process"]],
                    capture_output=True, timeout=10)
     _terminate_local_proc(key)
     get_spark_cluster_status.clear()
@@ -819,7 +827,8 @@ elif page == "🦀 Migration":
             with head:
                 st.markdown(f"**{table['label']}** · `{table['name']}` — {_parity_label(s)}")
                 if table["kind"] == "analytics":
-                    st.caption(f"Spark: `spark_jobs/analytics/{table['name']}.py` → "
+                    job_class = next(j["class"] for j in ANALYTICS_JOBS if j["name"] == table["name"])
+                    st.caption(f"Spark: `spark_jobs/analytics/…/{job_class}.scala` → "
                                f"Rust: `rust_pipeline/src/analytics/{table['name']}.rs`")
             with action:
                 blocked_reason = None
@@ -981,6 +990,10 @@ elif page == "⚙️ Pipeline Jobs":
     """)
 
     def start_spark(key: str):
+        uses_jar = ANALYTICS_JAR_IN_CONTAINER in SPARK_JOBS[key]["app"]
+        if uses_jar and not _IN_DOCKER and not (PROJECT_ROOT / ANALYTICS_JAR).exists():
+            st.error("Scala analytics jar not built — run `sbt package` in spark_jobs/analytics/ first (see README).")
+            return
         start_job(key, spark_submit_command(SPARK_JOBS[key]))
 
     def start_rust(key: str):

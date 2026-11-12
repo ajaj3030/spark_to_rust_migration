@@ -1,0 +1,22 @@
+# Each processor keeps its Kafka offsets (SQLite) next to the Delta table it
+# writes, so offsets and data survive restarts together. Volumes stand in for
+# object storage here; delta-rs can write the same tables to s3:// paths.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: telemetry-stream-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vehicle-state-stream-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
