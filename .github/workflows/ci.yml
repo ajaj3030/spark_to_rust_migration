@@ -45,4 +45,4 @@ jobs:
           python-version: "3.11"
       - run: pip install ruff==0.17.5
       - name: Syntax errors and undefined or unused names
-        run: ruff check spark_jobs data_generator --select E9,F
+        run: ruff check spark_jobs data_generator dashboard --select E9,F

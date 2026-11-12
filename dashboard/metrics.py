@@ -1,102 +1,44 @@
 """
-Shared metrics store for pipeline instrumentation.
+Metrics reader for the dashboard.
 
-Provides a thread-safe, JSON-file-backed metrics reader.  Each pipeline
-container writes its own JSON sidecar to the shared ``logs/`` volume.
-The Streamlit dashboard reads those files to build the metrics dict.
+Each pipeline process writes a JSON sidecar to the shared ``logs/`` volume:
 
-Delta table statistics are computed on-demand via the ``deltalake``
-Python library (no database required).
+    generator_metrics.json        data_generator (Kafka producer)
+    spark_stream_metrics.json     spark_jobs/streaming_job.py
+    spark_state_metrics.json      spark_jobs/vehicle_state_job.py
+    rust_metrics.json             rust-pipeline stream
+    rust_state_metrics.json       rust-pipeline state
+    validation_report_<table>.json  rust-pipeline validate (one per table/job)
 
-The public API is unchanged from the previous DuckDB-backed version so
-callers (dashboard/app.py, data_generator/generator.py) require no changes.
+The dashboard only reads these files; it never writes pipeline metrics.
 """
 
 import json
 import logging
-import os
 import threading
-import time
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 METRICS_DIR = Path(__file__).resolve().parent.parent / "logs"
-DELTA_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "delta_output"
-SPARK_STREAM_JSON_PATH = METRICS_DIR / "spark_stream_metrics.json"
-SPARK_ACCOUNT_JSON_PATH = METRICS_DIR / "spark_account_metrics.json"
-LEGACY_SPARK_JSON_PATH = METRICS_DIR / "spark_metrics.json"
-SPARK_API_DUMP_PATH = METRICS_DIR / "spark_api_dump.json"
-RUST_JSON_PATH = METRICS_DIR / "rust_metrics.json"
-RUST_ACCT_JSON_PATH = METRICS_DIR / "rust_acct_metrics.json"
-VALIDATION_JSON_PATH = METRICS_DIR / "validation_report.json"
 GENERATOR_JSON_PATH = METRICS_DIR / "generator_metrics.json"
+SPARK_STREAM_JSON_PATH = METRICS_DIR / "spark_stream_metrics.json"
+SPARK_STATE_JSON_PATH = METRICS_DIR / "spark_state_metrics.json"
+# Spark jobs started outside the dashboard write to the bridge's default file
+LEGACY_SPARK_JSON_PATH = METRICS_DIR / "spark_metrics.json"
+RUST_STREAM_JSON_PATH = METRICS_DIR / "rust_metrics.json"
+RUST_STATE_JSON_PATH = METRICS_DIR / "rust_state_metrics.json"
 
 _lock = threading.Lock()
 
 
-# ── Delta table helpers ───────────────────────────────────────
-
-# Known Delta tables and their paths (relative to DELTA_OUTPUT_DIR)
-_DELTA_TABLES = {
-    "transactions": "financial_transactions",
-    "accounts": "accounts",
-}
-
-
-def _read_delta_table_stats(table_name: str) -> dict:
-    """Read Delta table stats on-demand using the deltalake library.
-
-    Uses only metadata operations — never reads the full table into memory.
-    Falls back to file-count-only stats if metadata read fails.
-    """
-    _DEFAULT = {"version": 0, "num_files": 0, "row_count": 0,
-                "size_bytes": 0, "last_update": None}
-    table_dir = DELTA_OUTPUT_DIR / _DELTA_TABLES.get(table_name, table_name)
+def _read_json(path: Path) -> dict | None:
     try:
-        if not table_dir.exists():
-            return _DEFAULT
-        # Check for _delta_log directory — required for a valid delta table
-        delta_log = table_dir / "_delta_log"
-        if not delta_log.exists():
-            return _DEFAULT
-        from deltalake import DeltaTable
-        import pyarrow as pa
-        dt = DeltaTable(str(table_dir))
-        version = dt.version()
-        # Get row count and file sizes from metadata (avoids slow per-file stat calls)
-        arro3_table = dt.get_add_actions(flatten=True)
-        add_actions = pa.table(arro3_table).to_pydict()
-        row_count = sum(add_actions.get("num_records", [0]))
-        total_size = sum(add_actions.get("size_bytes", [0]))
-        num_files = len(add_actions.get("path", []))
-        return {
-            "version": version,
-            "num_files": num_files,
-            "row_count": int(row_count),
-            "size_bytes": total_size,
-            "last_update": time.time(),
-        }
-    except Exception as exc:
-        logger.debug("Could not read delta table %s: %s", table_name, exc)
-        return {"version": 0, "num_files": 0, "row_count": 0,
-                "size_bytes": 0, "last_update": None}
-
-
-# ── Public API (unchanged signatures) ────────────────────────
-
-
-def reset_metrics():
-    """Reset all metrics by deleting JSON sidecar files."""
-    with _lock:
-        for p in [SPARK_STREAM_JSON_PATH, SPARK_ACCOUNT_JSON_PATH, LEGACY_SPARK_JSON_PATH,
-                   RUST_JSON_PATH, RUST_ACCT_JSON_PATH,
-                   VALIDATION_JSON_PATH, GENERATOR_JSON_PATH]:
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                pass
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read metrics file %s: %s", path, exc)
+    return None
 
 
 def _default_engine_metrics() -> dict:
@@ -115,247 +57,7 @@ def _default_engine_metrics() -> dict:
     }
 
 
-def _read_json_metrics(path: Path) -> dict | None:
-    try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return None
-
-
-def _looks_like_stream_metrics(data: dict | None) -> bool:
-    if not data:
-        return False
-    return bool(data.get("transform_times_ms") or data.get("batch_details") or data.get("executor"))
-
-
-def _looks_like_account_metrics(data: dict | None) -> bool:
-    if not data:
-        return False
-    return bool(data.get("micro_batches_completed", 0) > 0 and not _looks_like_stream_metrics(data))
-
-
-def _read_spark_stream_json() -> dict:
-    """Read Spark streaming metrics from the best available source.
-
-    Checks the dedicated streaming JSON file first, then spark_api_dump.json,
-    then a legacy shared file only when it clearly looks like streaming data.
-    (Spark REST API dump).  Returns whichever has more micro-batches so that
-    a complete historical run is preferred over an incomplete live snapshot.
-    """
-    live = _read_json_metrics(SPARK_STREAM_JSON_PATH)
-    legacy = _read_json_metrics(LEGACY_SPARK_JSON_PATH)
-    if not live and _looks_like_stream_metrics(legacy):
-        live = legacy
-
-    dump = _parse_spark_api_dump()
-
-    # Pick the richer source
-    live_batches = (live or {}).get("micro_batches_completed", 0)
-    dump_batches = (dump or {}).get("micro_batches_completed", 0)
-
-    if live and dump:
-        return live if live_batches >= dump_batches else dump
-    if live:
-        return live
-    if dump:
-        return dump
-
-    return _default_engine_metrics()
-
-
-def _read_spark_account_json() -> dict:
-    """Read Spark account-upsert metrics from the dedicated JSON sidecar.
-
-    Falls back to the legacy shared Spark metrics file only when it clearly
-    looks like account-upsert data.
-    """
-    live = _read_json_metrics(SPARK_ACCOUNT_JSON_PATH)
-    legacy = _read_json_metrics(LEGACY_SPARK_JSON_PATH)
-    if live:
-        return live
-    if _looks_like_account_metrics(legacy):
-        return legacy
-    return _default_engine_metrics()
-
-
-def _parse_spark_api_dump() -> dict | None:
-    """Parse spark_api_dump.json (Spark REST API response) into the
-    normalised metrics dict that the dashboard expects.
-
-    The dump contains ``stages.value`` (list of completed stage objects)
-    and ``executors.value``.  Stages whose description contains
-    ``"batch = <N>"`` are grouped into micro-batches and aggregated.
-    """
-    import re as _re
-
-    try:
-        if not SPARK_API_DUMP_PATH.exists():
-            return None
-        raw = SPARK_API_DUMP_PATH.read_bytes()
-        data = json.loads(raw.decode("utf-8-sig"))
-    except Exception:
-        return None
-
-    stages = data.get("stages", {}).get("value", [])
-    if not stages:
-        return None
-
-    # Group stages by batch number ------------------------------------------
-    batch_map: dict[int, list] = {}
-    for stg in stages:
-        desc = stg.get("description", "") or stg.get("name", "")
-        m = _re.search(r"batch\s*=\s*(\d+)", desc, _re.IGNORECASE)
-        if m:
-            batch_id = int(m.group(1))
-            batch_map.setdefault(batch_id, []).append(stg)
-
-    if not batch_map:
-        return None
-
-    # Aggregate per-batch metrics -------------------------------------------
-    batch_details = []
-    batch_durations_ms: list[float] = []
-    transform_times_ms: list[float] = []
-    delta_write_times_ms: list[float] = []
-    total_rows = 0
-
-    for bid in sorted(batch_map):
-        stg_list = batch_map[bid]
-        rows = sum(s.get("inputRecords", 0) for s in stg_list)
-        run_ms = sum(s.get("executorRunTime", 0) for s in stg_list)
-        # executorCpuTime is in nanoseconds in Spark REST API
-        cpu_ns = sum(s.get("executorCpuTime", 0) for s in stg_list)
-        cpu_ms = cpu_ns / 1_000_000
-        gc_ms = sum(s.get("jvmGcTime", 0) for s in stg_list)
-        in_bytes = sum(s.get("inputBytes", 0) for s in stg_list)
-        out_bytes = sum(s.get("outputBytes", 0) for s in stg_list)
-        shuf_r = sum(s.get("shuffleReadBytes", 0) for s in stg_list)
-        shuf_w = sum(s.get("shuffleWriteBytes", 0) for s in stg_list)
-        tasks = sum(s.get("numCompleteTasks", 0) for s in stg_list)
-        peak_mem = max((s.get("peakExecutionMemory", 0) for s in stg_list), default=0)
-
-        # Estimate "transform" as cpu_ms; "write" as run_ms - cpu_ms (I/O wait)
-        write_ms = max(0, run_ms - cpu_ms)
-
-        total_rows += rows
-        batch_durations_ms.append(float(run_ms))
-        transform_times_ms.append(round(cpu_ms, 1))
-        delta_write_times_ms.append(round(write_ms, 1))
-
-        batch_details.append({
-            "batch_id": bid,
-            "rows": rows,
-            "wall_ms": run_ms,
-            "cpu_ms": round(cpu_ms, 1),
-            "gc_ms": gc_ms,
-            "cpu_util_pct": round(cpu_ms / max(1, run_ms) * 100, 1),
-            "gc_pct": round(gc_ms / max(1, run_ms) * 100, 1),
-            "input_mb": round(in_bytes / 1_048_576, 2),
-            "output_mb": round(out_bytes / 1_048_576, 2),
-            "shuffle_read_mb": round(shuf_r / 1_048_576, 2),
-            "shuffle_write_mb": round(shuf_w / 1_048_576, 2),
-            "peak_memory_mb": round(peak_mem / 1_048_576, 2),
-            "tasks": tasks,
-        })
-
-    # Executor summary -------------------------------------------------------
-    executors = data.get("executors", {}).get("value", [])
-    exec_summary = {}
-    if executors:
-        active_cores = sum(e.get("totalCores", 0) for e in executors if e.get("id") != "driver")
-        total_tasks = sum(e.get("totalTasks", 0) for e in executors)
-        total_gc_ms = sum(e.get("totalGCTime", 0) for e in executors)
-        total_dur_ms = sum(e.get("totalDuration", 0) for e in executors)
-        total_input = sum(e.get("totalInputBytes", 0) for e in executors)
-        total_output = sum(e.get("totalOutputBytes", 0) for e in executors)
-        total_shuf_r = sum(e.get("totalShuffleRead", 0) for e in executors)
-        total_shuf_w = sum(e.get("totalShuffleWrite", 0) for e in executors)
-        peak_mem_exec = max((e.get("peakMemoryMetrics", {}).get("JVMHeapMemory", 0)
-                             for e in executors), default=0)
-        max_mem = sum(e.get("maxMemory", 0) for e in executors)
-
-        exec_summary = {
-            "active_cores": active_cores,
-            "total_tasks": total_tasks,
-            "total_gc_ms": total_gc_ms,
-            "gc_pct": round(total_gc_ms / max(1, total_dur_ms) * 100, 1),
-            "total_duration_ms": total_dur_ms,
-            "peak_memory_mb": round(peak_mem_exec / 1_048_576, 2),
-            "max_memory_mb": round(max_mem / 1_048_576, 2),
-            "total_input_mb": round(total_input / 1_048_576, 2),
-            "total_output_mb": round(total_output / 1_048_576, 2),
-            "total_shuffle_read_mb": round(total_shuf_r / 1_048_576, 2),
-            "total_shuffle_write_mb": round(total_shuf_w / 1_048_576, 2),
-        }
-
-    last_batch_rows = batch_details[-1]["rows"] if batch_details else 0
-    return {
-        "status": "completed",
-        "micro_batches_completed": len(batch_details),
-        "total_rows_processed": total_rows,
-        "last_batch_rows": last_batch_rows,
-        "first_update": None,
-        "last_update": None,
-        "batch_durations_ms": batch_durations_ms,
-        "transform_times_ms": transform_times_ms,
-        "delta_write_times_ms": delta_write_times_ms,
-        "batch_details": batch_details,
-        "executor": exec_summary,
-    }
-
-
-def _build_engine_metrics(data: dict) -> dict:
-    """Build a normalized metrics dict from a raw JSON metrics file (Spark or Rust)."""
-    bd = data.get("batch_durations_ms", [])
-    tt = data.get("transform_times_ms", [])
-    dw = data.get("delta_write_times_ms", [])
-    return {
-        "status": data.get("status", "idle"),
-        "micro_batches_completed": data.get("micro_batches_completed", 0),
-        "total_rows_processed": data.get("total_rows_processed", 0),
-        "avg_batch_duration_ms": sum(bd) / len(bd) if bd else 0.0,
-        "avg_transform_time_ms": sum(tt) / len(tt) if tt else 0.0,
-        "avg_delta_write_time_ms": sum(dw) / len(dw) if dw else 0.0,
-        "batch_durations_ms": bd,
-        "transform_times_ms": tt,
-        "delta_write_times_ms": dw,
-        "last_batch_rows": data.get("last_batch_rows", 0),
-        "first_update": data.get("first_update"),
-        "last_update": data.get("last_update"),
-        "batch_details": data.get("batch_details", []),
-        "executor": data.get("executor", {}),
-    }
-
-
-def _read_rust_json() -> dict:
-    """Read Rust pipeline metrics from the JSON file written by the container."""
-    return _read_json_metrics(RUST_JSON_PATH) or _default_engine_metrics()
-
-
-def _read_rust_account_json() -> dict:
-    """Read Rust account-upsert metrics from the JSON file written by the container."""
-    return _read_json_metrics(RUST_ACCT_JSON_PATH) or _default_engine_metrics()
-
-
-def _read_validation_json() -> dict:
-    """Read the last validation report."""
-    try:
-        if VALIDATION_JSON_PATH.exists():
-            return json.loads(VALIDATION_JSON_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
-
-
-def _read_generator_json() -> dict:
-    """Read generator metrics from the JSON sidecar file."""
-    try:
-        if GENERATOR_JSON_PATH.exists():
-            return json.loads(GENERATOR_JSON_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        pass
+def _default_generator_metrics() -> dict:
     return {
         "status": "idle",
         "start_time": None,
@@ -374,119 +76,66 @@ def _read_generator_json() -> dict:
     }
 
 
-def get_metrics() -> dict:
-    """Read the current metrics snapshot (same dict shape as before)."""
+def _looks_like_stream_metrics(data: dict | None) -> bool:
+    """The streaming job reports transform timings; the state job does not."""
+    return bool(data and (data.get("transform_times_ms") or data.get("executor")))
+
+
+def _read_spark_stream() -> dict:
+    live = _read_json(SPARK_STREAM_JSON_PATH)
+    if live:
+        return live
+    legacy = _read_json(LEGACY_SPARK_JSON_PATH)
+    return legacy if _looks_like_stream_metrics(legacy) else _default_engine_metrics()
+
+
+def _read_spark_state() -> dict:
+    live = _read_json(SPARK_STATE_JSON_PATH)
+    if live:
+        return live
+    legacy = _read_json(LEGACY_SPARK_JSON_PATH)
+    is_state = legacy and legacy.get("micro_batches_completed", 0) > 0 and not _looks_like_stream_metrics(legacy)
+    return legacy if is_state else _default_engine_metrics()
+
+
+def _with_averages(data: dict) -> dict:
+    """Normalise a raw engine sidecar (Spark or Rust) and add averages."""
+    merged = {**_default_engine_metrics(), **data}
+
+    def avg(values: list) -> float:
+        return sum(values) / len(values) if values else 0.0
+
+    merged["avg_batch_duration_ms"] = avg(merged["batch_durations_ms"])
+    merged["avg_transform_time_ms"] = avg(merged["transform_times_ms"])
+    merged["avg_delta_write_time_ms"] = avg(merged["delta_write_times_ms"])
+    return merged
+
+
+def reset_metrics():
+    """Delete all engine and generator sidecars (validation reports are kept)."""
     with _lock:
-        # ── Delta tables: compute on-demand from deltalake ──
-        delta = {}
-        for table_name in _DELTA_TABLES:
-            stats = _read_delta_table_stats(table_name)
-            delta[f"{table_name}_table"] = stats
+        for path in [GENERATOR_JSON_PATH, SPARK_STREAM_JSON_PATH, SPARK_STATE_JSON_PATH,
+                     LEGACY_SPARK_JSON_PATH, RUST_STREAM_JSON_PATH, RUST_STATE_JSON_PATH]:
+            path.unlink(missing_ok=True)
 
-        # ── Generator metrics: read from JSON sidecar ──
-        gen = _read_generator_json()
 
-        # ── Spark metrics: read from JSON file (written by container) ──
-        spark_stream_data = _read_spark_stream_json()
-        spark_account_data = _read_spark_account_json()
-        rust_stream_data = _read_rust_json()
-        rust_account_data = _read_rust_account_json()
-        bd = spark_stream_data.get("batch_durations_ms", [])
-        tt = spark_stream_data.get("transform_times_ms", [])
-        dw = spark_stream_data.get("delta_write_times_ms", [])
-
+def get_metrics() -> dict:
+    """Current snapshot of generator, Spark and Rust metrics."""
+    with _lock:
         return {
-            "generator": {
-                "status": gen.get("status", "idle"),
-                "start_time": gen.get("start_time"),
-                "target_bytes": gen.get("target_bytes", 0),
-                "bytes_sent": gen.get("bytes_sent", 0),
-                "records_sent": gen.get("records_sent", 0),
-                "batches_completed": gen.get("batches_completed", 0),
-                "elapsed_seconds": gen.get("elapsed_seconds", 0.0),
-                "throughput_mb_per_sec": gen.get("throughput_mb_per_sec", 0.0),
-                "avg_batch_time_ms": gen.get("avg_batch_time_ms", 0.0),
-                "avg_publish_latency_ms": gen.get("avg_publish_latency_ms", 0.0),
-                "batch_timings_ms": gen.get("batch_timings_ms", []),
-                "publish_latencies_ms": gen.get("publish_latencies_ms", []),
-                "errors": gen.get("errors", 0),
-                "last_update": gen.get("last_update"),
-            },
-            "spark": {
-                "status": spark_stream_data.get("status", "idle"),
-                "micro_batches_completed": spark_stream_data.get("micro_batches_completed", 0),
-                "total_rows_processed": spark_stream_data.get("total_rows_processed", 0),
-                "avg_batch_duration_ms": sum(bd) / len(bd) if bd else 0.0,
-                "avg_transform_time_ms": sum(tt) / len(tt) if tt else 0.0,
-                "avg_delta_write_time_ms": sum(dw) / len(dw) if dw else 0.0,
-                "batch_durations_ms": bd,
-                "transform_times_ms": tt,
-                "delta_write_times_ms": dw,
-                "last_batch_rows": spark_stream_data.get("last_batch_rows", 0),
-                "first_update": spark_stream_data.get("first_update"),
-                "last_update": spark_stream_data.get("last_update"),
-                "batch_details": spark_stream_data.get("batch_details", []),
-                "executor": spark_stream_data.get("executor", {}),
-            },
-            "spark_stream": _build_engine_metrics(spark_stream_data),
-            "spark_account": _build_engine_metrics(spark_account_data),
-            "delta": delta,
-            "pipeline": {
-                "end_to_end_latency_ms": 0.0,
-                "last_update": None,
-            },
-            "rust": _build_engine_metrics(rust_stream_data),
-            "rust_stream": _build_engine_metrics(rust_stream_data),
-            "rust_account": _build_engine_metrics(rust_account_data),
-            "validation": _read_validation_json(),
+            "generator": {**_default_generator_metrics(), **(_read_json(GENERATOR_JSON_PATH) or {})},
+            "spark_stream": _with_averages(_read_spark_stream()),
+            "spark_state": _with_averages(_read_spark_state()),
+            "rust_stream": _with_averages(_read_json(RUST_STREAM_JSON_PATH) or {}),
+            "rust_state": _with_averages(_read_json(RUST_STATE_JSON_PATH) or {}),
         }
 
 
-# ── Legacy update functions (no-ops, kept for API compatibility) ──
-
-
-def update_generator_metrics(
-    *,
-    status: Optional[str] = None,
-    start_time: Optional[float] = None,
-    target_bytes: Optional[int] = None,
-    bytes_sent: Optional[int] = None,
-    records_sent: Optional[int] = None,
-    batches_completed: Optional[int] = None,
-    elapsed_seconds: Optional[float] = None,
-    throughput_mb_per_sec: Optional[float] = None,
-    batch_time_ms: Optional[float] = None,
-    publish_latency_ms: Optional[float] = None,
-    errors: Optional[int] = None,
-):
-    """No-op: generator writes its own JSON sidecar file."""
-    pass
-
-
-def update_spark_metrics(
-    *,
-    status: Optional[str] = None,
-    batch_duration_ms: Optional[float] = None,
-    transform_time_ms: Optional[float] = None,
-    delta_write_time_ms: Optional[float] = None,
-    rows_processed: Optional[int] = None,
-):
-    """No-op: Spark writes its own JSON via metrics_bridge."""
-    pass
-
-
-def update_delta_metrics(
-    table_name: str,
-    *,
-    version: Optional[int] = None,
-    num_files: Optional[int] = None,
-    row_count: Optional[int] = None,
-    size_bytes: Optional[int] = None,
-):
-    """No-op: delta stats are computed on-demand from deltalake."""
-    pass
-
-
-def update_pipeline_latency(latency_ms: float):
-    """No-op: pipeline latency is not actively tracked."""
-    pass
+def get_validation_report(table: str) -> dict | None:
+    """The last `rust-pipeline validate` report for a table or analytics job,
+    with the file's modification time added as ``written_at`` (epoch secs)."""
+    path = METRICS_DIR / f"validation_report_{table}.json"
+    report = _read_json(path)
+    if report is not None:
+        report["written_at"] = path.stat().st_mtime
+    return report

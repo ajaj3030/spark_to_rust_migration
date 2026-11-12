@@ -178,7 +178,28 @@ docker exec -d -w /opt spark-master bash -c "/opt/spark/bin/spark-submit --maste
 
 Tests, including the analytics parity tests: `(cd rust_pipeline && CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo test)`.
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests for Rust, and
-ruff for the Python jobs, on every push and pull request.
+ruff for the Python code, on every push and pull request.
+
+## Dashboard
+
+Steps 4–7 can also be driven from the Streamlit dashboard:
+
+```bash
+.venv/bin/streamlit run dashboard/app.py   # http://localhost:8501
+```
+
+| Page | What it shows |
+|------|---------------|
+| Overview | Pipeline status, generator progress, telemetry and vehicle-state tables |
+| Fleet | Battery health, charging, OTA rollout and diagnostics from the analytics tables, read from Spark's or Rust's output |
+| Migration | Per job: ported to Rust or not, Spark/Rust row counts, last parity result. **Run Rust & validate** rebuilds the binary, runs the port and runs `validate --job` |
+| Data Generator | Publish telemetry to Kafka |
+| Pipeline Jobs | Start and stop the Spark and Rust jobs; reset checkpoints and tables |
+| Delta Explorer | Schema, sample rows, SQL (DuckDB) and history for every table, with exactly-once and privacy check queries |
+| Performance | Spark vs Rust streaming timings |
+
+A job counts as ported once its parity test in
+`rust_pipeline/src/analytics/<job>.rs` is no longer `#[ignore]`d.
 
 ## Event schema
 
@@ -207,7 +228,7 @@ coarsening · T6 VIN pseudonymisation · T7 `row_id`, `sw_major`, `sw_minor`.
 
 ## Not yet updated for telemetry
 
-`dashboard/`, `delta_viewer/`, `cleanup/`, `spark_jobs/metrics_bridge.py` and
+`delta_viewer/`, `cleanup/`, `spark_jobs/metrics_bridge.py` and
 `scripts/generate_pipeline_report.py` still assume the original
 financial-transactions schema.
 

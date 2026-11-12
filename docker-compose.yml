@@ -193,6 +193,8 @@ services:
       - ./checkpoints:/app/checkpoints
       - ./logs:/app/logs
       - ./data_generator:/app/data_generator:ro
+      # Read-only, so the Migration page can see which jobs are ported
+      - ./rust_pipeline/src/analytics:/app/rust_pipeline/src/analytics:ro
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - STREAMLIT_SERVER_HEADLESS=true
