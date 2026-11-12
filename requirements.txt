@@ -1,6 +1,7 @@
 # ── Data Generator ──
 faker>=28.0.0
-kafka-python>=2.0.2
+kafka-python==2.0.2
+lz4>=4.3.0
 orjson>=3.10.0
 pyyaml>=6.0.1
 click>=8.1.7

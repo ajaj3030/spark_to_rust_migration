@@ -61,35 +61,34 @@ services:
       kafka:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
-    command: |
-      "
-      echo 'Creating Kafka topic: financial_transactions'
-      kafka-topics --create --if-not-exists \
-        --bootstrap-server kafka:29092 \
-        --topic financial_transactions \
-        --partitions 8 \
-        --replication-factor 1 \
-        --config retention.ms=604800000 \
-        --config max.message.bytes=10485760
+    command:
+      - |
+        echo 'Creating Kafka topic: financial_transactions'
+        kafka-topics --create --if-not-exists \
+          --bootstrap-server kafka:29092 \
+          --topic financial_transactions \
+          --partitions 8 \
+          --replication-factor 1 \
+          --config retention.ms=604800000 \
+          --config max.message.bytes=10485760
 
-      echo 'Creating Kafka topic: account_updates'
-      kafka-topics --create --if-not-exists \
-        --bootstrap-server kafka:29092 \
-        --topic account_updates \
-        --partitions 8 \
-        --replication-factor 1 \
-        --config retention.ms=604800000 \
-        --config max.message.bytes=10485760 \
-        --config cleanup.policy=compact
+        echo 'Creating Kafka topic: account_updates'
+        kafka-topics --create --if-not-exists \
+          --bootstrap-server kafka:29092 \
+          --topic account_updates \
+          --partitions 8 \
+          --replication-factor 1 \
+          --config retention.ms=604800000 \
+          --config max.message.bytes=10485760 \
+          --config cleanup.policy=compact
 
-      echo 'Enforcing 7-day retention on all topics (survives restarts)...'
-      kafka-configs --bootstrap-server kafka:29092 --entity-type topics --entity-name financial_transactions --alter --add-config retention.ms=604800000,max.message.bytes=10485760
-      kafka-configs --bootstrap-server kafka:29092 --entity-type topics --entity-name account_updates --alter --add-config retention.ms=604800000,max.message.bytes=10485760,cleanup.policy=compact
+        echo 'Enforcing 7-day retention on all topics (survives restarts)...'
+        kafka-configs --bootstrap-server kafka:29092 --entity-type topics --entity-name financial_transactions --alter --add-config retention.ms=604800000,max.message.bytes=10485760
+        kafka-configs --bootstrap-server kafka:29092 --entity-type topics --entity-name account_updates --alter --add-config retention.ms=604800000,max.message.bytes=10485760,cleanup.policy=compact
 
-      echo 'Topics created/configured successfully.'
-      kafka-topics --describe --bootstrap-server kafka:29092 --topic financial_transactions
-      kafka-topics --describe --bootstrap-server kafka:29092 --topic account_updates
-      "
+        echo 'Topics created/configured successfully.'
+        kafka-topics --describe --bootstrap-server kafka:29092 --topic financial_transactions
+        kafka-topics --describe --bootstrap-server kafka:29092 --topic account_updates
 
   # ---------- Spark ----------
   spark-master:
