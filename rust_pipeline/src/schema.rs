@@ -244,13 +244,16 @@ pub fn vehicle_state_schema() -> Schema {
 
 macro_rules! col_utf8 {
     ($recs:expr, $f:ident) => {
-        Arc::new(StringArray::from_iter_values($recs.iter().map(|r| r.$f.as_str()))) as ArrayRef
+        Arc::new(StringArray::from_iter_values(
+            $recs.iter().map(|r| r.$f.as_str()),
+        )) as ArrayRef
     };
 }
 macro_rules! col_utf8_opt {
     ($recs:expr, $f:ident) => {
-        Arc::new(StringArray::from($recs.iter().map(|r| r.$f.as_deref()).collect::<Vec<_>>()))
-            as ArrayRef
+        Arc::new(StringArray::from(
+            $recs.iter().map(|r| r.$f.as_deref()).collect::<Vec<_>>(),
+        )) as ArrayRef
     };
 }
 macro_rules! col_f64 {
@@ -260,7 +263,9 @@ macro_rules! col_f64 {
 }
 macro_rules! col_f64_opt {
     ($recs:expr, $f:ident) => {
-        Arc::new(Float64Array::from($recs.iter().map(|r| r.$f).collect::<Vec<_>>())) as ArrayRef
+        Arc::new(Float64Array::from(
+            $recs.iter().map(|r| r.$f).collect::<Vec<_>>(),
+        )) as ArrayRef
     };
 }
 macro_rules! col_i32 {
@@ -270,7 +275,9 @@ macro_rules! col_i32 {
 }
 macro_rules! col_i32_opt {
     ($recs:expr, $f:ident) => {
-        Arc::new(Int32Array::from($recs.iter().map(|r| r.$f).collect::<Vec<_>>())) as ArrayRef
+        Arc::new(Int32Array::from(
+            $recs.iter().map(|r| r.$f).collect::<Vec<_>>(),
+        )) as ArrayRef
     };
 }
 macro_rules! col_i64 {
@@ -280,13 +287,16 @@ macro_rules! col_i64 {
 }
 macro_rules! col_bool {
     ($recs:expr, $f:ident) => {
-        Arc::new(BooleanArray::from($recs.iter().map(|r| r.$f).collect::<Vec<_>>())) as ArrayRef
+        Arc::new(BooleanArray::from(
+            $recs.iter().map(|r| r.$f).collect::<Vec<_>>(),
+        )) as ArrayRef
     };
 }
 
 pub fn build_telemetry_batch(r: &[TelemetryOutput]) -> anyhow::Result<RecordBatch> {
-    let event_date =
-        Arc::new(Date32Array::from_iter_values(r.iter().map(|x| x.event_date))) as ArrayRef;
+    let event_date = Arc::new(Date32Array::from_iter_values(
+        r.iter().map(|x| x.event_date),
+    )) as ArrayRef;
     let columns: Vec<ArrayRef> = vec![
         col_utf8!(r, event_id),
         col_utf8!(r, event_type),
@@ -350,7 +360,10 @@ pub fn build_telemetry_batch(r: &[TelemetryOutput]) -> anyhow::Result<RecordBatc
         col_i32_opt!(r, sw_major),
         col_i32_opt!(r, sw_minor),
     ];
-    Ok(RecordBatch::try_new(Arc::new(telemetry_output_schema()), columns)?)
+    Ok(RecordBatch::try_new(
+        Arc::new(telemetry_output_schema()),
+        columns,
+    )?)
 }
 
 pub fn build_vehicle_state_batch(r: &[VehicleStateInput]) -> anyhow::Result<RecordBatch> {
@@ -370,5 +383,8 @@ pub fn build_vehicle_state_batch(r: &[VehicleStateInput]) -> anyhow::Result<Reco
         col_utf8_opt!(r, updated_at),
         col_utf8_opt!(r, first_seen_at),
     ];
-    Ok(RecordBatch::try_new(Arc::new(vehicle_state_schema()), columns)?)
+    Ok(RecordBatch::try_new(
+        Arc::new(vehicle_state_schema()),
+        columns,
+    )?)
 }

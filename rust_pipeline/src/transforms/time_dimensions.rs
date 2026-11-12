@@ -57,7 +57,7 @@ fn parse_timestamp(ts: &str) -> NaiveDateTime {
         return dt;
     }
     // Fallback: epoch
-    NaiveDateTime::from_timestamp_opt(0, 0).unwrap()
+    chrono::DateTime::UNIX_EPOCH.naive_utc()
 }
 
 /// Convert chrono weekday to Spark's convention: 1=Sun, 2=Mon, ..., 7=Sat

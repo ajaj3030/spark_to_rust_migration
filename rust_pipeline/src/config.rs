@@ -9,6 +9,7 @@ pub struct AppConfig {
     pub spark: SparkConfig,
     pub vehicle_state: VehicleStateConfig,
     pub delta: DeltaConfig,
+    pub analytics: AnalyticsConfig,
     #[serde(default)]
     pub rust: RustConfig,
 }
@@ -24,25 +25,18 @@ pub struct KafkaConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SparkConfig {
-    pub max_offsets_per_trigger: usize,
-    #[serde(default = "default_trigger")]
-    pub trigger_interval: String,
-    pub shuffle_partitions: i32,
     pub delta_output_path: String,
-    #[serde(default)]
-    pub local_delta_output: String,
-    pub cost_per_core_hour: f64,
-    pub worker_cores: i32,
-    pub worker_memory: String,
 }
-
-fn default_trigger() -> String { "10 seconds".into() }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct VehicleStateConfig {
     pub delta_output_path: String,
-    #[serde(default)]
-    pub local_delta_output: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AnalyticsConfig {
+    pub output_base: String,
+    pub local_output_base: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -83,20 +77,48 @@ pub struct RustConfig {
     pub state_metrics_file: String,
 }
 
-fn default_consumer_group() -> String { "rust-vehicle-telemetry-consumer".into() }
-fn default_batch_size() -> usize { 500_000 }
-fn default_flush_interval() -> u64 { 10 }
-fn default_rust_delta() -> String { "/opt/delta_output/vehicle_telemetry_rust".into() }
-fn default_rust_delta_local() -> String { "./delta_output/vehicle_telemetry_rust".into() }
-fn default_rust_checkpoint() -> String { "/opt/checkpoints/rust_vehicle_telemetry/offsets.db".into() }
-fn default_rust_checkpoint_local() -> String { "./checkpoints/rust_vehicle_telemetry/offsets.db".into() }
-fn default_rust_state_delta() -> String { "/opt/delta_output/vehicle_state_rust".into() }
-fn default_rust_state_delta_local() -> String { "./delta_output/vehicle_state_rust".into() }
-fn default_rust_state_ckpt() -> String { "/opt/checkpoints/rust_vehicle_state/offsets.db".into() }
-fn default_rust_state_ckpt_local() -> String { "./checkpoints/rust_vehicle_state/offsets.db".into() }
-fn default_state_consumer_group() -> String { "rust-vehicle-state-consumer".into() }
-fn default_metrics_file() -> String { "/opt/logs/rust_metrics.json".into() }
-fn default_state_metrics_file() -> String { "/opt/logs/rust_state_metrics.json".into() }
+fn default_consumer_group() -> String {
+    "rust-vehicle-telemetry-consumer".into()
+}
+fn default_batch_size() -> usize {
+    500_000
+}
+fn default_flush_interval() -> u64 {
+    10
+}
+fn default_rust_delta() -> String {
+    "/opt/delta_output/vehicle_telemetry_rust".into()
+}
+fn default_rust_delta_local() -> String {
+    "./delta_output/vehicle_telemetry_rust".into()
+}
+fn default_rust_checkpoint() -> String {
+    "/opt/checkpoints/rust_vehicle_telemetry/offsets.db".into()
+}
+fn default_rust_checkpoint_local() -> String {
+    "./checkpoints/rust_vehicle_telemetry/offsets.db".into()
+}
+fn default_rust_state_delta() -> String {
+    "/opt/delta_output/vehicle_state_rust".into()
+}
+fn default_rust_state_delta_local() -> String {
+    "./delta_output/vehicle_state_rust".into()
+}
+fn default_rust_state_ckpt() -> String {
+    "/opt/checkpoints/rust_vehicle_state/offsets.db".into()
+}
+fn default_rust_state_ckpt_local() -> String {
+    "./checkpoints/rust_vehicle_state/offsets.db".into()
+}
+fn default_state_consumer_group() -> String {
+    "rust-vehicle-state-consumer".into()
+}
+fn default_metrics_file() -> String {
+    "/opt/logs/rust_metrics.json".into()
+}
+fn default_state_metrics_file() -> String {
+    "/opt/logs/rust_state_metrics.json".into()
+}
 
 impl Default for RustConfig {
     fn default() -> Self {
@@ -134,50 +156,95 @@ impl AppConfig {
     }
 
     pub fn rust_delta_table_path(&self) -> String {
-        if self.is_docker() { self.rust.delta_output_path.clone() }
-        else { self.rust.local_delta_output.clone() }
+        if self.is_docker() {
+            self.rust.delta_output_path.clone()
+        } else {
+            self.rust.local_delta_output.clone()
+        }
     }
 
     pub fn rust_checkpoint_path(&self) -> String {
-        if self.is_docker() { self.rust.checkpoint_db.clone() }
-        else { self.rust.local_checkpoint_db.clone() }
+        if self.is_docker() {
+            self.rust.checkpoint_db.clone()
+        } else {
+            self.rust.local_checkpoint_db.clone()
+        }
     }
 
     pub fn rust_state_delta_path(&self) -> String {
-        if self.is_docker() { self.rust.state_delta_output_path.clone() }
-        else { self.rust.local_state_delta_output.clone() }
+        if self.is_docker() {
+            self.rust.state_delta_output_path.clone()
+        } else {
+            self.rust.local_state_delta_output.clone()
+        }
     }
 
     pub fn rust_state_checkpoint_path(&self) -> String {
-        if self.is_docker() { self.rust.state_checkpoint_db.clone() }
-        else { self.rust.local_state_checkpoint_db.clone() }
+        if self.is_docker() {
+            self.rust.state_checkpoint_db.clone()
+        } else {
+            self.rust.local_state_checkpoint_db.clone()
+        }
     }
 
     pub fn rust_metrics_path(&self) -> String {
-        if self.is_docker() { self.rust.metrics_file.clone() }
-        else { "./logs/rust_metrics.json".into() }
+        if self.is_docker() {
+            self.rust.metrics_file.clone()
+        } else {
+            "./logs/rust_metrics.json".into()
+        }
     }
 
     pub fn rust_state_metrics_path(&self) -> String {
-        if self.is_docker() { self.rust.state_metrics_file.clone() }
-        else { "./logs/rust_state_metrics.json".into() }
+        if self.is_docker() {
+            self.rust.state_metrics_file.clone()
+        } else {
+            "./logs/rust_state_metrics.json".into()
+        }
     }
 
     pub fn delta_table_path(&self) -> String {
-        if self.is_docker() { self.spark.delta_output_path.clone() }
-        else { self.delta.table_path.clone() }
+        if self.is_docker() {
+            self.spark.delta_output_path.clone()
+        } else {
+            self.delta.table_path.clone()
+        }
     }
 
     pub fn state_delta_path(&self) -> String {
-        if self.is_docker() { self.vehicle_state.delta_output_path.clone() }
-        else { self.delta.state_table_path.clone() }
+        if self.is_docker() {
+            self.vehicle_state.delta_output_path.clone()
+        } else {
+            self.delta.state_table_path.clone()
+        }
+    }
+}
+
+impl AppConfig {
+    /// Delta table written by the Spark version of an analytics job.
+    pub fn spark_analytics_path(&self, job: &str) -> String {
+        format!("{}/{}", self.analytics_base(), job)
+    }
+
+    /// Delta table written by the Rust port of an analytics job.
+    pub fn rust_analytics_path(&self, job: &str) -> String {
+        format!("{}/{}_rust", self.analytics_base(), job)
+    }
+
+    fn analytics_base(&self) -> String {
+        let base = if self.is_docker() {
+            &self.analytics.output_base
+        } else {
+            &self.analytics.local_output_base
+        };
+        base.trim_end_matches('/').to_string()
     }
 }
 
 pub fn load_config(path: &Path) -> Result<AppConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config: {}", path.display()))?;
-    let cfg: AppConfig = serde_yaml::from_str(&text)
-        .with_context(|| "Failed to parse app_config.yaml")?;
+    let cfg: AppConfig =
+        serde_yaml::from_str(&text).with_context(|| "Failed to parse app_config.yaml")?;
     Ok(cfg)
 }

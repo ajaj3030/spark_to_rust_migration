@@ -57,3 +57,6 @@ img.txt
 # Data (large generated files)
 *.parquet
 *.snappy
+
+# Parity fixtures for the Rust analytics ports are small and must be committed
+!rust_pipeline/tests/fixtures/**/*.parquet

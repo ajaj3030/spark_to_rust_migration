@@ -107,6 +107,8 @@ services:
       - "4040:4040"
       - "4041:4041"
     volumes:
+      # Parity fixtures for the Rust analytics ports (build_parity_fixtures.py)
+      - ./rust_pipeline/tests/fixtures:/opt/rust_pipeline/tests/fixtures
       - ./spark_jobs:/opt/spark-jobs
       - ./config:/opt/config
       - ./delta_output:/opt/delta_output

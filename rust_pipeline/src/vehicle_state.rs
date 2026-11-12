@@ -77,7 +77,11 @@ pub async fn run_vehicle_state_pipeline(cfg: &AppConfig) -> Result<()> {
         tpl.add_partition_offset(topic, p, checkpoint.get_offset(topic, p)?)?;
     }
     consumer.assign(&tpl)?;
-    tracing::info!("Vehicle state: assigned {} partitions on {}", cfg.kafka.partitions, topic);
+    tracing::info!(
+        "Vehicle state: assigned {} partitions on {}",
+        cfg.kafka.partitions,
+        topic
+    );
 
     writer::ensure_parent_dir(&delta_path)?;
     let mut metrics = MetricsBridge::new(&cfg.rust_state_metrics_path());
@@ -98,7 +102,11 @@ pub async fn run_vehicle_state_pipeline(cfg: &AppConfig) -> Result<()> {
             .collect();
         let rejected = messages.len() - snapshots.len();
         if rejected > 0 {
-            tracing::warn!("State batch {}: {} messages failed to parse and were skipped", batch_id, rejected);
+            tracing::warn!(
+                "State batch {}: {} messages failed to parse and were skipped",
+                batch_id,
+                rejected
+            );
         }
         if snapshots.is_empty() {
             continue;
@@ -131,7 +139,11 @@ pub async fn run_vehicle_state_pipeline(cfg: &AppConfig) -> Result<()> {
         )?;
         tracing::info!(
             "State batch {}: {} snapshots → {} vehicles | merge {}ms | total {}ms",
-            batch_id, snapshot_count, vehicle_count, t_write.as_millis(), t_total.as_millis(),
+            batch_id,
+            snapshot_count,
+            vehicle_count,
+            t_write.as_millis(),
+            t_total.as_millis(),
         );
         batch_id += 1;
     }
@@ -199,9 +211,9 @@ async fn merge_into_vehicle_state(table: deltalake::DeltaTable, source: RecordBa
             })
         })?
         .when_not_matched_insert(|insert| {
-            ALL_STATE_FIELDS
-                .iter()
-                .fold(insert, |i, name| i.set(*name, col(format!("source.{name}"))))
+            ALL_STATE_FIELDS.iter().fold(insert, |i, name| {
+                i.set(*name, col(format!("source.{name}")))
+            })
         })?
         .await?;
     Ok(())
@@ -246,7 +258,9 @@ async fn collect_batch(consumer: &StreamConsumer, max: usize, timeout: Duration)
 fn compute_max_offsets(messages: &[OwnedMsg]) -> HashMap<(String, i32), i64> {
     let mut offsets: HashMap<(String, i32), i64> = HashMap::new();
     for m in messages {
-        let entry = offsets.entry((m.topic.clone(), m.partition)).or_insert(m.offset);
+        let entry = offsets
+            .entry((m.topic.clone(), m.partition))
+            .or_insert(m.offset);
         *entry = (*entry).max(m.offset);
     }
     // Store offset + 1 (next offset to read)

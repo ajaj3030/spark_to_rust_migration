@@ -30,17 +30,3 @@ pub async fn write_batch(
         .await?;
     Ok(())
 }
-
-/// Overwrite a Delta table (not used by the current pipelines).
-pub async fn write_batch_overwrite(
-    table_path: &str,
-    batch: RecordBatch,
-    partition_columns: &[String],
-) -> Result<()> {
-    let ops = DeltaOps::try_from_uri(table_path).await?;
-    ops.write(vec![batch])
-        .with_save_mode(SaveMode::Overwrite)
-        .with_partition_columns(partition_columns.to_vec())
-        .await?;
-    Ok(())
-}

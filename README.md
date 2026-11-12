@@ -42,10 +42,10 @@ rust-pipeline validate  ──  compares each Spark table with its Rust twin (th
 |---|---|---|---|
 | Telemetry enrichment (`streaming_job.py`) | ✅ | ✅ `rust-pipeline stream` | `validate` |
 | Vehicle state MERGE (`vehicle_state_job.py`) | ✅ | ✅ `rust-pipeline state` | `validate --state` |
-| Battery health daily (`analytics/battery_health_daily.py`) | ✅ | ❌ | — |
-| Charging sessions (`analytics/charging_sessions.py`) | ✅ | ❌ | — |
-| OTA rollout (`analytics/ota_rollout.py`) | ✅ | ❌ | — |
-| Diagnostic alerts (`analytics/diagnostic_alerts.py`) | ✅ | ❌ | — |
+| Battery health daily (`analytics/battery_health_daily.py`) | ✅ | ❌ placeholder | parity test (ignored until ported) |
+| Charging sessions (`analytics/charging_sessions.py`) | ✅ | ❌ placeholder | parity test (ignored until ported) |
+| OTA rollout (`analytics/ota_rollout.py`) | ✅ | ❌ placeholder | parity test (ignored until ported) |
+| Diagnostic alerts (`analytics/diagnostic_alerts.py`) | ✅ | ❌ placeholder | parity test (ignored until ported) |
 
 ## Batch analytics jobs
 
@@ -95,14 +95,47 @@ carries no location.
 
 ## Parity validation
 
+One comparison (`rust_pipeline/src/validate.rs`) is used everywhere. PASS
+requires no missing rows on either side (matched on the table's key
+columns), every column equal on every row (doubles within 1e-9), and no
+raw `vin` / `latitude` / `longitude` / `kafka_key` columns. For analytics
+jobs it also requires exactly Spark's column names and types — the
+contract downstream readers depend on.
+
+**In CI (no Kafka or Spark needed).** `rust_pipeline/tests/fixtures/` holds
+a fixed slice of real pipeline output (150 vehicles) and Spark's output for
+each analytics job on that slice. Each job's parity test runs the Rust port
+on the same input and compares. Regenerate fixtures only when a Spark job
+changes:
+
 ```bash
-./rust_pipeline/target/debug/rust-pipeline --config config/app_config.yaml validate --state
+docker exec -w /opt spark-master /opt/spark/bin/spark-submit --jars $JARS \
+  /opt/spark-jobs/analytics/build_parity_fixtures.py --local --config /opt/config/app_config.yaml
 ```
 
-PASS requires no missing rows on either side, every compared column equal
-on every row (doubles within 1e-9), and no raw PII columns. Reports are
-written to `logs/validation_report_<table>.json`; the command exits
-non-zero on FAIL so CI can gate on it.
+**Against live tables.**
+
+```bash
+rust-pipeline --config config/app_config.yaml validate --state              # telemetry + vehicle_state
+rust-pipeline --config config/app_config.yaml analytics charging_sessions   # run a ported job
+rust-pipeline --config config/app_config.yaml validate --job charging_sessions
+```
+
+Reports go to `logs/validation_report_<table>.json`; FAIL exits non-zero.
+
+## Porting an analytics job
+
+Everything a port touches is in its own file,
+`rust_pipeline/src/analytics/<job>.rs` (registry, dispatcher and CLI are
+already wired), so several jobs can be ported in parallel without
+conflicts. Done means:
+
+1. `summarize` reproduces `spark_jobs/analytics/<job>.py` in DataFusion,
+   reading the registered `telemetry` / `vehicle_state` tables
+2. the `#[ignore]` is removed from the job's parity test
+3. CI is green: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+   `cargo test`
+4. the migration status table above is updated
 
 Rust reproduces Spark's `round()` exactly (`transforms/rounding.rs`): Spark
 rounds HALF_UP on the decimal form of the double, so `round(1.005, 2)` is
@@ -143,7 +176,9 @@ docker exec -d -w /opt spark-master bash -c "/opt/spark/bin/spark-submit --maste
 ./rust_pipeline/target/debug/rust-pipeline --config config/app_config.yaml validate --state
 ```
 
-Unit tests: `(cd rust_pipeline && CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo test)`.
+Tests, including the analytics parity tests: `(cd rust_pipeline && CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo test)`.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests for Rust, and
+ruff for the Python jobs, on every push and pull request.
 
 ## Event schema
 

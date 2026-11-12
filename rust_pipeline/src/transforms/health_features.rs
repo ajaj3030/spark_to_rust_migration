@@ -30,8 +30,10 @@ pub struct HealthFeatures {
 /// Spark parity: add_health_features. A null comparison counts as false.
 /// `cell_temp_spread` is the rounded value from battery_features (T3).
 pub fn apply(input: &TelemetryInput, cell_temp_spread: Option<f64>) -> HealthFeatures {
-    let thermal_alert = input.max_cell_temp.map_or(false, |t| t >= THERMAL_MAX_CELL_TEMP_C)
-        || cell_temp_spread.map_or(false, |s| s >= THERMAL_CELL_SPREAD_C);
+    let thermal_alert = input
+        .max_cell_temp
+        .is_some_and(|t| t >= THERMAL_MAX_CELL_TEMP_C)
+        || cell_temp_spread.is_some_and(|s| s >= THERMAL_CELL_SPREAD_C);
 
     let is_fault = input.warning_state.as_deref() == Some("WARNING_ON")
         || is_one_of(&input.charge_state, FAULT_CHARGE_STATES)
@@ -39,7 +41,7 @@ pub fn apply(input: &TelemetryInput, cell_temp_spread: Option<f64>) -> HealthFea
 
     let needs_service = input
         .battery_health_level
-        .map_or(false, |h| h < SERVICE_HEALTH_THRESHOLD)
+        .is_some_and(|h| h < SERVICE_HEALTH_THRESHOLD)
         || thermal_alert
         || is_fault;
 
@@ -63,7 +65,7 @@ pub fn apply(input: &TelemetryInput, cell_temp_spread: Option<f64>) -> HealthFea
 }
 
 fn is_one_of(value: &Option<String>, allowed: &[&str]) -> bool {
-    value.as_deref().map_or(false, |v| allowed.contains(&v))
+    value.as_deref().is_some_and(|v| allowed.contains(&v))
 }
 
 /// Replicates Spark UDF classify_health(battery_health_level)

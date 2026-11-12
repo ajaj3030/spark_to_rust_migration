@@ -12,7 +12,6 @@ REST API is available at localhost:4040.
 import json
 import logging
 import urllib.request
-from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 

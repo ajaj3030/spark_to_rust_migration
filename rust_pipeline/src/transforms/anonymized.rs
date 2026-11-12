@@ -8,6 +8,7 @@ pub struct AnonymizedColumns {
 /// Spark parity: add_anonymized_columns (privacy)
 /// - vin_hash ← sha2(vin, 256)
 /// - vin_wmi  ← substring(vin, 1, 3)  (manufacturer identifier, not personal)
+///
 /// The raw VIN is not carried into the output record.
 pub fn apply(vin: &str) -> AnonymizedColumns {
     AnonymizedColumns {

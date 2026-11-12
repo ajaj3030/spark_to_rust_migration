@@ -9,7 +9,6 @@ Usage:
 
 import logging
 import os
-import sys
 
 import click
 import yaml

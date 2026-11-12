@@ -1,3 +1,4 @@
+mod analytics;
 mod checkpoint;
 mod config;
 mod consumer;
@@ -14,7 +15,10 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "rust-pipeline", about = "Rust Kafka→Delta vehicle telemetry pipeline (port of the Spark jobs)")]
+#[command(
+    name = "rust-pipeline",
+    about = "Rust Kafka→Delta vehicle telemetry pipeline (port of the Spark jobs)"
+)]
 struct Cli {
     /// Path to app_config.yaml (shared with Spark)
     #[arg(short, long)]
@@ -30,15 +34,25 @@ enum Command {
     Stream,
     /// Run the vehicle-state MERGE stream (port of vehicle_state_job.py)
     State,
-    /// Validate Rust output against Spark output
+    /// Run one ported batch analytics job (port of spark_jobs/analytics/<job>.py)
+    Analytics {
+        /// battery_health_daily | charging_sessions | ota_rollout | diagnostic_alerts
+        job: String,
+    },
+    /// Validate Rust output against Spark output (telemetry by default)
     Validate {
+        /// Override the Spark telemetry table path
         #[arg(long)]
         spark_path: Option<String>,
+        /// Override the Rust telemetry table path
         #[arg(long)]
         rust_path: Option<String>,
         /// Also validate the vehicle_state tables
         #[arg(long, default_value_t = false)]
         state: bool,
+        /// Validate one analytics job's output instead of telemetry
+        #[arg(long)]
+        job: Option<String>,
     },
 }
 
@@ -60,16 +74,42 @@ async fn main() -> Result<()> {
             tracing::info!("Starting vehicle-state upsert pipeline");
             vehicle_state::run_vehicle_state_pipeline(&cfg).await?;
         }
-        Command::Validate { spark_path, rust_path, state } => {
+        Command::Analytics { job } => {
+            analytics::run(analytics::find_job(&job)?, &cfg).await?;
+        }
+        Command::Validate {
+            spark_path,
+            rust_path,
+            state,
+            job: Some(job),
+        } => {
+            if spark_path.is_some() || rust_path.is_some() || state {
+                anyhow::bail!("--job cannot be combined with --spark-path, --rust-path or --state");
+            }
+            let job = analytics::find_job(&job)?;
+            validate::run_validation(
+                &cfg.spark_analytics_path(job.name),
+                &cfg.rust_analytics_path(job.name),
+                &job.comparison(),
+            )
+            .await?;
+        }
+        Command::Validate {
+            spark_path,
+            rust_path,
+            state,
+            job: None,
+        } => {
             let sp = spark_path.unwrap_or_else(|| cfg.delta_table_path());
             let rp = rust_path.unwrap_or_else(|| cfg.rust_delta_table_path());
-            tracing::info!("Validating: spark={} rust={}", sp, rp);
-            validate::run_validation(&sp, &rp).await?;
+            validate::run_validation(&sp, &rp, &validate::TELEMETRY).await?;
             if state {
-                let sa = cfg.state_delta_path();
-                let ra = cfg.rust_state_delta_path();
-                tracing::info!("Validating vehicle_state: spark={} rust={}", sa, ra);
-                validate::run_validation(&sa, &ra).await?;
+                validate::run_validation(
+                    &cfg.state_delta_path(),
+                    &cfg.rust_state_delta_path(),
+                    &validate::VEHICLE_STATE,
+                )
+                .await?;
             }
         }
     }

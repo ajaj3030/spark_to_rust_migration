@@ -34,7 +34,6 @@ Run locally:
 
 import argparse
 import logging
-import sys
 import time as _time
 
 import yaml

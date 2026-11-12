@@ -14,9 +14,18 @@ pub struct NullHandled {
 /// - odometer_km           ← na.fill(0.0)
 pub fn apply(input: &TelemetryInput) -> NullHandled {
     NullHandled {
-        model_safe: input.model.clone().unwrap_or_else(|| "MODEL_UNKNOWN".into()),
-        software_version_safe: input.software_version.clone().unwrap_or_else(|| "0.0.0".into()),
-        power_state_safe: input.power_state.clone().unwrap_or_else(|| "POWER_STATE_UNKNOWN".into()),
+        model_safe: input
+            .model
+            .clone()
+            .unwrap_or_else(|| "MODEL_UNKNOWN".into()),
+        software_version_safe: input
+            .software_version
+            .clone()
+            .unwrap_or_else(|| "0.0.0".into()),
+        power_state_safe: input
+            .power_state
+            .clone()
+            .unwrap_or_else(|| "POWER_STATE_UNKNOWN".into()),
         odometer_km: input.odometer_km.unwrap_or(0.0),
     }
 }

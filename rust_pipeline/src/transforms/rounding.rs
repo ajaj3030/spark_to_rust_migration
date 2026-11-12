@@ -20,7 +20,11 @@ pub fn spark_round(x: f64, scale: u32) -> f64 {
         scaled += 1;
     }
     let rounded = scaled as f64 / 10f64.powi(scale as i32);
-    if x.is_sign_negative() { -rounded } else { rounded }
+    if x.is_sign_negative() {
+        -rounded
+    } else {
+        rounded
+    }
 }
 
 #[cfg(test)]

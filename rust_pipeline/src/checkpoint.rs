@@ -65,28 +65,4 @@ impl Checkpoint {
         )?;
         Ok(())
     }
-
-    /// Get all committed offsets as a map of (topic, partition) → offset.
-    pub fn all_offsets(&self, topic: &str) -> Result<Vec<(i32, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT partition, offset FROM checkpoints WHERE topic = ?1 ORDER BY partition",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![topic], |row| {
-            Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
-        }
-        Ok(result)
-    }
-
-    /// Delete all checkpoints for a topic (used during reset).
-    pub fn clear(&self, topic: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM checkpoints WHERE topic = ?1",
-            rusqlite::params![topic],
-        )?;
-        Ok(())
-    }
 }

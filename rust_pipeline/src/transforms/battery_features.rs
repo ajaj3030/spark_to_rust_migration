@@ -33,7 +33,9 @@ pub fn apply(input: &TelemetryInput) -> BatteryFeatures {
         _ => None,
     };
 
-    let degradation_pct = input.battery_health_level.map(|h| spark_round(100.0 - h, 2));
+    let degradation_pct = input
+        .battery_health_level
+        .map(|h| spark_round(100.0 - h, 2));
 
     let km_per_percent = match (input.remaining_range, soc) {
         (Some(range), Some(s)) if s > 0.0 => Some(spark_round(range / s, 3)),

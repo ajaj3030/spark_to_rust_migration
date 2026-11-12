@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # CMake 4 rejects the bundled librdkafka's old cmake_minimum_required
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  rust:
+    name: Rust — fmt, clippy, tests (incl. Spark parity)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust_pipeline
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust_pipeline
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests (ported analytics jobs must match Spark's output on the fixtures)
+        run: cargo test
+
+  python:
+    name: Python — lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff==0.17.5
+      - name: Syntax errors and undefined or unused names
+        run: ruff check spark_jobs data_generator --select E9,F

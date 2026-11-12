@@ -1,161 +1,257 @@
-//! Parity check: compare a Spark-written Delta table with its Rust-written
-//! counterpart. This is the acceptance gate for every migrated job.
+//! Parity check: compare a Spark-produced table with its Rust counterpart.
+//! This is the acceptance gate for every migrated job, used both by the
+//! `validate` CLI (live Delta tables) and by the parity tests (fixtures).
 //!
 //! PASS requires: no rows missing on either side, every compared column
-//! matching on every joined row, and (for telemetry) no raw PII columns.
+//! equal on every row (doubles within FLOAT_TOLERANCE), no forbidden
+//! columns, and — when `check_types` is set — the same columns with the
+//! same types as Spark, so downstream readers see an identical schema.
 
 use anyhow::{bail, Result};
 use deltalake::arrow::array::Int64Array;
+use deltalake::arrow::datatypes::{DataType, Schema};
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::datafusion::prelude::*;
 use serde_json::json;
 use std::sync::Arc;
 
-/// Raw identifiers that must never reach the enriched telemetry table.
-const FORBIDDEN_PII_COLUMNS: &[&str] = &["vin", "latitude", "longitude", "kafka_key"];
+/// Raw identifiers that must never reach an analytics-facing table.
+pub const FORBIDDEN_PII_COLUMNS: &[&str] = &["vin", "latitude", "longitude", "kafka_key"];
 
-/// Doubles are produced by the same Spark-compatible rounding on both sides,
-/// so they must match to within float noise.
+/// Both engines must round identically (see transforms/rounding.rs), so
+/// doubles may only differ by float noise.
 const FLOAT_TOLERANCE: f64 = 1e-9;
 
-struct TableProfile {
-    name: &'static str,
-    join_col: &'static str,
-    float_cols: &'static [&'static str],
-    exact_cols: &'static [&'static str],
-    check_pii: bool,
+/// What to compare and how. Tables are registered as `spark_data` (the
+/// reference) and `rust_data` (the port) before calling `compare`.
+pub struct Comparison {
+    pub table: &'static str,
+    pub key_cols: &'static [&'static str],
+    pub forbidden_columns: &'static [&'static str],
+    pub ignore_columns: &'static [&'static str],
+    pub check_types: bool,
 }
 
-const TELEMETRY: TableProfile = TableProfile {
-    name: "vehicle_telemetry",
-    join_col: "event_id",
-    float_cols: &[
-        "odometer_km", "energy_pct", "cell_temp_spread", "degradation_pct",
-        "km_per_percent", "lat_coarse", "lon_coarse",
-    ],
-    exact_cols: &[
-        "event_type", "sequence_number", "model_safe", "software_version_safe",
-        "power_state_safe", "event_date", "event_year", "event_month", "event_day",
-        "event_hour", "event_dayofweek", "is_weekend", "event_quarter", "date_str",
-        "soc_bucket", "health_tier", "thermal_alert", "is_fault", "needs_service",
-        "severity_level", "vin_hash", "vin_wmi", "row_id", "sw_major", "sw_minor",
-    ],
-    check_pii: true,
+pub const TELEMETRY: Comparison = Comparison {
+    table: "vehicle_telemetry",
+    key_cols: &["event_id"],
+    forbidden_columns: FORBIDDEN_PII_COLUMNS,
+    // Spark stores the Kafka timestamp as TIMESTAMP, Rust as epoch millis
+    ignore_columns: &["kafka_timestamp"],
+    check_types: false,
 };
 
-const VEHICLE_STATE: TableProfile = TableProfile {
-    name: "vehicle_state",
-    join_col: "vin",
-    float_cols: &["odometer_km", "charge_percent", "battery_health_level"],
-    exact_cols: &[
-        "sequence_number", "event_count", "software_version", "power_state",
-        "last_event_type", "updated_at", "first_seen_at",
-    ],
-    check_pii: false,
+pub const VEHICLE_STATE: Comparison = Comparison {
+    table: "vehicle_state",
+    key_cols: &["vin"],
+    forbidden_columns: &[],
+    ignore_columns: &[],
+    check_types: false,
 };
 
-pub async fn run_validation(spark_path: &str, rust_path: &str) -> Result<()> {
+pub struct ParityReport {
+    pub passed: bool,
+    pub failures: Vec<String>,
+    pub json: serde_json::Value,
+}
+
+/// Open two Delta tables, compare them, write a JSON report, and fail
+/// (non-zero exit) if they differ.
+pub async fn run_validation(spark_path: &str, rust_path: &str, cmp: &Comparison) -> Result<()> {
     let ctx = SessionContext::new();
-    tracing::info!("Opening Spark table: {}", spark_path);
-    ctx.register_table("spark_data", Arc::new(deltalake::open_table(spark_path).await?))?;
-    tracing::info!("Opening Rust table: {}", rust_path);
-    ctx.register_table("rust_data", Arc::new(deltalake::open_table(rust_path).await?))?;
+    tracing::info!("Spark table: {}", spark_path);
+    ctx.register_table(
+        "spark_data",
+        Arc::new(deltalake::open_table(spark_path).await?),
+    )?;
+    tracing::info!("Rust table:  {}", rust_path);
+    ctx.register_table(
+        "rust_data",
+        Arc::new(deltalake::open_table(rust_path).await?),
+    )?;
 
-    let spark_columns = column_names(&ctx, "spark_data").await?;
-    let profile = if spark_columns.iter().any(|c| c == "event_id") { &TELEMETRY } else { &VEHICLE_STATE };
-    tracing::info!("Profile: {} (join on {})", profile.name, profile.join_col);
-
-    let spark_rows = sql_count(&ctx, "SELECT COUNT(*) FROM spark_data").await?;
-    let rust_rows = sql_count(&ctx, "SELECT COUNT(*) FROM rust_data").await?;
-    let jc = profile.join_col;
-    let missing_in_rust = sql_count(&ctx, &format!(
-        "SELECT COUNT(*) FROM spark_data s LEFT ANTI JOIN rust_data r ON s.{jc} = r.{jc}"
-    )).await?;
-    let missing_in_spark = sql_count(&ctx, &format!(
-        "SELECT COUNT(*) FROM rust_data r LEFT ANTI JOIN spark_data s ON s.{jc} = r.{jc}"
-    )).await?;
-    tracing::info!("Row counts — Spark: {}  Rust: {}", spark_rows, rust_rows);
-    tracing::info!("Missing in Rust: {}  Missing in Spark: {}", missing_in_rust, missing_in_spark);
-
-    let mut column_results = serde_json::Map::new();
-    let mut mismatched_columns = 0;
-    for col in profile.float_cols {
-        let n = count_mismatches(&ctx, jc, &format!(
-            "(s.{col} IS NULL) <> (r.{col} IS NULL) OR ABS(s.{col} - r.{col}) > {FLOAT_TOLERANCE}"
-        )).await?;
-        mismatched_columns += report_column(col, n, &mut column_results);
-    }
-    for col in profile.exact_cols {
-        let n = count_mismatches(&ctx, jc, &format!("s.{col} IS DISTINCT FROM r.{col}")).await?;
-        mismatched_columns += report_column(col, n, &mut column_results);
-    }
-
-    let mut pii_leaks = Vec::new();
-    if profile.check_pii {
-        let rust_columns = column_names(&ctx, "rust_data").await?;
-        for (side, cols) in [("spark", &spark_columns), ("rust", &rust_columns)] {
-            for forbidden in FORBIDDEN_PII_COLUMNS {
-                if cols.iter().any(|c| c == forbidden) {
-                    pii_leaks.push(format!("{side}.{forbidden}"));
-                }
-            }
-        }
-        if pii_leaks.is_empty() {
-            tracing::info!("  privacy – OK (no raw VIN / GPS / kafka_key columns)");
-        } else {
-            tracing::error!("  privacy – raw PII columns present: {:?}", pii_leaks);
-        }
-    }
-
-    let passed = missing_in_rust == 0 && missing_in_spark == 0
-        && mismatched_columns == 0 && pii_leaks.is_empty();
-    let status = if passed { "PASS" } else { "FAIL" };
-    let report = json!({
-        "table": profile.name,
-        "spark_table": spark_path,
-        "rust_table": rust_path,
-        "spark_row_count": spark_rows,
-        "rust_row_count": rust_rows,
-        "missing_in_rust": missing_in_rust,
-        "missing_in_spark": missing_in_spark,
-        "column_mismatches": column_results,
-        "pii_columns_present": pii_leaks,
-        "status": status,
-    });
-    write_report(profile.name, &report)?;
-    tracing::info!("Status: {}", status);
-
-    if !passed {
-        bail!("parity validation failed for {}", profile.name);
+    let report = compare(&ctx, cmp).await?;
+    write_report(cmp.table, &report.json)?;
+    if !report.passed {
+        bail!(
+            "parity validation failed for {}: {}",
+            cmp.table,
+            report.failures.join("; ")
+        );
     }
     Ok(())
 }
 
-fn report_column(col: &str, mismatches: i64, results: &mut serde_json::Map<String, serde_json::Value>) -> usize {
-    results.insert(col.to_string(), json!(mismatches));
-    if mismatches > 0 {
-        tracing::warn!("  {} – {} mismatches", col, mismatches);
-        1
+pub async fn compare(ctx: &SessionContext, cmp: &Comparison) -> Result<ParityReport> {
+    let spark_schema = table_schema(ctx, "spark_data").await?;
+    let rust_schema = table_schema(ctx, "rust_data").await?;
+    let mut failures = Vec::new();
+    tracing::info!("Comparing {} on ({})", cmp.table, cmp.key_cols.join(", "));
+
+    check_forbidden_columns(cmp, &spark_schema, &rust_schema, &mut failures);
+    if cmp.check_types {
+        check_schema_contract(&spark_schema, &rust_schema, &mut failures);
+    }
+
+    let spark_rows = sql_count(ctx, "SELECT COUNT(*) FROM spark_data").await?;
+    let rust_rows = sql_count(ctx, "SELECT COUNT(*) FROM rust_data").await?;
+    let on = join_condition(cmp.key_cols);
+    let missing_in_rust = sql_count(
+        ctx,
+        &format!("SELECT COUNT(*) FROM spark_data s LEFT ANTI JOIN rust_data r ON {on}"),
+    )
+    .await?;
+    let missing_in_spark = sql_count(
+        ctx,
+        &format!("SELECT COUNT(*) FROM rust_data r LEFT ANTI JOIN spark_data s ON {on}"),
+    )
+    .await?;
+    tracing::info!("Rows — Spark: {spark_rows}  Rust: {rust_rows}  missing in Rust: {missing_in_rust}  missing in Spark: {missing_in_spark}");
+    if missing_in_rust > 0 || missing_in_spark > 0 {
+        failures.push(format!(
+            "rows missing: {missing_in_rust} in Rust, {missing_in_spark} in Spark"
+        ));
+    }
+
+    let mut column_mismatches = serde_json::Map::new();
+    for field in spark_schema.fields() {
+        let col = field.name();
+        let skip = cmp.key_cols.contains(&col.as_str())
+            || cmp.ignore_columns.contains(&col.as_str())
+            || rust_schema.field_with_name(col).is_err();
+        if skip {
+            continue;
+        }
+        let mismatches = count_column_mismatches(ctx, &on, col, field.data_type()).await?;
+        column_mismatches.insert(col.clone(), json!(mismatches));
+        if mismatches > 0 {
+            tracing::warn!("  {col} – {mismatches} mismatched rows");
+            failures.push(format!("{col}: {mismatches} mismatched rows"));
+        } else {
+            tracing::info!("  {col} – OK");
+        }
+    }
+
+    let passed = failures.is_empty();
+    tracing::info!("Status: {}", if passed { "PASS" } else { "FAIL" });
+    let json = json!({
+        "table": cmp.table,
+        "key_columns": cmp.key_cols,
+        "spark_row_count": spark_rows,
+        "rust_row_count": rust_rows,
+        "missing_in_rust": missing_in_rust,
+        "missing_in_spark": missing_in_spark,
+        "column_mismatches": column_mismatches,
+        "failures": failures,
+        "status": if passed { "PASS" } else { "FAIL" },
+    });
+    Ok(ParityReport {
+        passed,
+        failures,
+        json,
+    })
+}
+
+fn check_forbidden_columns(
+    cmp: &Comparison,
+    spark: &Schema,
+    rust: &Schema,
+    failures: &mut Vec<String>,
+) {
+    if cmp.forbidden_columns.is_empty() {
+        return;
+    }
+    let mut leaked = Vec::new();
+    for (side, schema) in [("spark", spark), ("rust", rust)] {
+        for forbidden in cmp.forbidden_columns {
+            if schema.field_with_name(forbidden).is_ok() {
+                leaked.push(format!("{side}.{forbidden}"));
+            }
+        }
+    }
+    if leaked.is_empty() {
+        tracing::info!(
+            "  privacy – OK (none of {:?} present)",
+            cmp.forbidden_columns
+        );
     } else {
-        tracing::info!("  {} – OK", col);
-        0
+        tracing::error!("  privacy – forbidden columns present: {:?}", leaked);
+        failures.push(format!("forbidden columns present: {}", leaked.join(", ")));
     }
 }
 
-async fn count_mismatches(ctx: &SessionContext, join_col: &str, predicate: &str) -> Result<i64> {
-    sql_count(ctx, &format!(
-        "SELECT COUNT(*) FROM spark_data s JOIN rust_data r ON s.{join_col} = r.{join_col} \
-         WHERE {predicate}"
-    )).await
+/// Downstream consumers read these tables by name and type, so a port must
+/// produce exactly Spark's columns and types (nullability may differ).
+fn check_schema_contract(spark: &Schema, rust: &Schema, failures: &mut Vec<String>) {
+    for field in spark.fields() {
+        match rust.field_with_name(field.name()) {
+            Err(_) => failures.push(format!("column missing in Rust: {}", field.name())),
+            Ok(r) if !same_type(r.data_type(), field.data_type()) => failures.push(format!(
+                "type mismatch for {}: Spark {:?}, Rust {:?}",
+                field.name(),
+                field.data_type(),
+                r.data_type()
+            )),
+            Ok(_) => {}
+        }
+    }
+    for field in rust.fields() {
+        if spark.field_with_name(field.name()).is_err() {
+            failures.push(format!("extra column in Rust: {}", field.name()));
+        }
+    }
 }
 
-async fn column_names(ctx: &SessionContext, table: &str) -> Result<Vec<String>> {
-    let df = ctx.table(table).await?;
-    Ok(df.schema().fields().iter().map(|f| f.name().clone()).collect())
+/// Timestamps compare by unit only: Spark marks them UTC, which DataFusion
+/// may surface as "UTC" or "+00:00".
+fn same_type(a: &DataType, b: &DataType) -> bool {
+    match (a, b) {
+        (DataType::Timestamp(unit_a, _), DataType::Timestamp(unit_b, _)) => unit_a == unit_b,
+        _ => a == b,
+    }
+}
+
+async fn count_column_mismatches(
+    ctx: &SessionContext,
+    on: &str,
+    col: &str,
+    dt: &DataType,
+) -> Result<i64> {
+    let predicate = if matches!(dt, DataType::Float32 | DataType::Float64) {
+        format!("(s.\"{col}\" IS NULL) <> (r.\"{col}\" IS NULL) OR ABS(s.\"{col}\" - r.\"{col}\") > {FLOAT_TOLERANCE}")
+    } else {
+        format!("s.\"{col}\" IS DISTINCT FROM r.\"{col}\"")
+    };
+    sql_count(
+        ctx,
+        &format!("SELECT COUNT(*) FROM spark_data s JOIN rust_data r ON {on} WHERE {predicate}"),
+    )
+    .await
+}
+
+/// Null-safe equi-join on the key columns. `IS NOT DISTINCT FROM` would be
+/// planned as a nested-loop join (quadratic), so null keys are mapped to a
+/// sentinel instead and compared with `=`, which stays a hash join.
+fn join_condition(key_cols: &[&str]) -> String {
+    let null_safe =
+        |side: &str, k: &str| format!("COALESCE(CAST({side}.\"{k}\" AS VARCHAR), '\u{0}NULL')");
+    key_cols
+        .iter()
+        .map(|k| format!("{} = {}", null_safe("s", k), null_safe("r", k)))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+async fn table_schema(ctx: &SessionContext, table: &str) -> Result<Schema> {
+    Ok(ctx.table(table).await?.schema().as_arrow().clone())
 }
 
 fn write_report(table: &str, report: &serde_json::Value) -> Result<()> {
-    let dir = if std::path::Path::new("/opt/logs").exists() { "/opt/logs" } else { "./logs" };
+    let dir = if std::path::Path::new("/opt/logs").exists() {
+        "/opt/logs"
+    } else {
+        "./logs"
+    };
     std::fs::create_dir_all(dir)?;
     let path = format!("{dir}/validation_report_{table}.json");
     std::fs::write(&path, serde_json::to_string_pretty(report)?)?;
@@ -172,6 +268,11 @@ fn first_count(batches: &[RecordBatch]) -> i64 {
     batches
         .first()
         .filter(|b| b.num_rows() > 0)
-        .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>().map(|a| a.value(0)))
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|a| a.value(0))
+        })
         .unwrap_or(0)
 }

@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
-use rdkafka::{Offset, TopicPartitionList};
+use rdkafka::TopicPartitionList;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -99,7 +99,9 @@ pub async fn run_streaming_pipeline(cfg: &AppConfig) -> Result<()> {
         if rejected > 0 {
             tracing::warn!(
                 "Batch {}: {} of {} messages failed to parse and were skipped",
-                batch_id, rejected, row_count,
+                batch_id,
+                rejected,
+                row_count,
             );
         }
 
