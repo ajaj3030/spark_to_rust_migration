@@ -8,11 +8,15 @@
 //!
 //! Porting a job only touches that job's file. The registry and dispatcher
 //! below already list every job, so parallel ports do not conflict.
+//!
+//! Where Spark SQL and DataFusion differ (rounding, division, result types),
+//! use the shared helpers in `spark_functions`.
 
 pub mod battery_health_daily;
 pub mod charging_sessions;
 pub mod diagnostic_alerts;
 pub mod ota_rollout;
+pub mod spark_functions;
 
 #[cfg(test)]
 pub mod parity;
