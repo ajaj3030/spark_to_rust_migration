@@ -1,10 +1,11 @@
 //! Rust port of the Spark job
 //! spark_jobs/analytics/src/main/scala/telemetry/analytics/DiagnosticAlerts.scala
 
-use super::spark_functions::{spark_divide, spark_int, spark_round, spark_sha2, spark_timestamp};
+use super::spark_functions::{
+    spark_divide, spark_int, spark_round, spark_sha2, spark_timestamp, spark_to_timestamp,
+};
 use super::Job;
 use anyhow::Result;
-use deltalake::arrow::datatypes::{DataType, TimeUnit};
 
 use deltalake::datafusion::functions_aggregate::expr_fn::{count, count_distinct, max, min, sum};
 use deltalake::datafusion::functions_window::expr_fn::dense_rank;
@@ -15,13 +16,6 @@ pub const JOB: Job = Job {
     name: "diagnostic_alerts",
     key_cols: &["dtc_code", "ecu", "model_safe", "battery_pack_type"],
 };
-
-fn event_time_ts() -> Expr {
-    try_cast(
-        col("event_time"),
-        DataType::Timestamp(TimeUnit::Nanosecond, None),
-    )
-}
 
 pub async fn summarize(ctx: &SessionContext) -> Result<DataFrame> {
     // vehicle_state is keyed by raw VIN; Spark's sha2(vin, 256) gives a
@@ -70,10 +64,10 @@ pub async fn summarize(ctx: &SessionContext) -> Result<DataFrame> {
                 count_distinct(col("vin_hash")).alias("vehicles_affected"),
                 sum(when(col("warning_state").eq(lit("WARNING_ON")), lit(1)).otherwise(lit(0))?)
                     .alias("warning_on_events"),
-                // try_cast: a malformed event_time is NULL (Spark non-ANSI),
-                // where to_timestamp would abort the whole job.
-                min(spark_timestamp(event_time_ts())).alias("first_seen"),
-                max(spark_timestamp(event_time_ts())).alias("last_seen"),
+                // spark_to_timestamp: a malformed event_time is NULL (Spark
+                // non-ANSI), where DataFusion's to_timestamp would abort.
+                min(spark_timestamp(spark_to_timestamp(col("event_time")))).alias("first_seen"),
+                max(spark_timestamp(spark_to_timestamp(col("event_time")))).alias("last_seen"),
             ],
         )?;
 

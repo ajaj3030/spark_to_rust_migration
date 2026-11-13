@@ -56,6 +56,15 @@ pub fn spark_int(value: Expr) -> Expr {
     cast(value, DataType::Int32)
 }
 
+/// Spark's `to_timestamp(string)`: parses the same datetime formats, but a
+/// malformed value gives NULL (non-ANSI mode). DataFusion's `to_timestamp`
+/// aborts the whole query instead, so this uses `try_cast` to
+/// `timestamp[ns]` — pair with [`spark_timestamp`] for `timestamp[us, UTC]`.
+#[allow(dead_code)]
+pub fn spark_to_timestamp(value: Expr) -> Expr {
+    try_cast(value, DataType::Timestamp(TimeUnit::Nanosecond, None))
+}
+
 /// Cast to Spark's TimestampType as stored in Parquet/Delta: `timestamp[us, UTC]`.
 #[allow(dead_code)]
 pub fn spark_timestamp(value: Expr) -> Expr {
@@ -319,6 +328,39 @@ mod tests {
             )]
         );
         assert_eq!(col(2), [None]);
+    }
+
+    #[tokio::test]
+    async fn to_timestamp_is_null_not_error_on_bad_input() {
+        // Spark non-ANSI: unparseable strings are NULL; DataFusion's own
+        // to_timestamp aborts with a parse error instead.
+        let ctx = SessionContext::new();
+        let df = ctx
+            .sql("SELECT '2026-01-02T03:04:05Z' AS ok, 'not-a-time' AS bad, CAST(NULL AS VARCHAR) AS none")
+            .await
+            .unwrap()
+            .select(vec![
+                spark_to_timestamp(col("ok")).alias("ok"),
+                spark_to_timestamp(col("bad")).alias("bad"),
+                spark_to_timestamp(col("none")).alias("none"),
+            ])
+            .unwrap();
+        let b = df.collect().await.unwrap().remove(0);
+        assert_eq!(
+            b.column(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        let ts = |i: usize| {
+            b.column(i)
+                .as_any()
+                .downcast_ref::<deltalake::arrow::array::TimestampNanosecondArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ts(0), [Some(1767323045000000000)]);
+        assert_eq!(ts(1), [None]);
+        assert_eq!(ts(2), [None]);
     }
 
     #[tokio::test]
