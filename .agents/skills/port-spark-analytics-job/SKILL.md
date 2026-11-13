@@ -23,7 +23,8 @@ worked example to copy from.
 3. **Shared helpers live in `analytics/spark_functions.rs`.** Use them; do
    not reimplement rounding, division or casts inside the job file. If the
    job needs a Spark-compatible helper that is not there yet (e.g. `max_by`),
-   stop and ask before editing `spark_functions.rs` or any other file.
+   add it there and unit-test it. Never modify, rename or delete an existing
+   helper or its semantics; if a change is needed, stop and ask.
 4. **If Spark's output looks wrong** (a bug in the Scala job, a fixture value
    you believe is incorrect, behaviour you would not want to copy), stop and
    tell the user with the evidence. Do not work around it, "fix" it in Rust,
