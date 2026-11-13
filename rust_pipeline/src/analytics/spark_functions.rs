@@ -9,14 +9,19 @@
 //! | `a / b` is always DOUBLE, NULL when `b = 0`     | int / int is integer division; x / 0.0 is inf/NaN | [`spark_divide`]  |
 //! | `row_number`/`rank`/`dense_rank` are INT        | UInt64                         | [`spark_int`]     |
 //! | timestamps are `timestamp[us, UTC]`             | `to_timestamp` gives `timestamp[ns]` | [`spark_timestamp`] |
+//! | `max_by(value, ord)` in a groupBy               | no equivalent aggregate          | [`spark_max_by`]  |
 
 use crate::transforms::rounding;
+use deltalake::arrow::array::ArrayRef;
 use deltalake::arrow::array::Float64Array;
+use deltalake::arrow::datatypes::Field;
 use deltalake::arrow::datatypes::{DataType, Float64Type, TimeUnit};
 use deltalake::datafusion::common::cast::as_float64_array;
 use deltalake::datafusion::common::{exec_err, Result, ScalarValue};
+use deltalake::datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use deltalake::datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    Accumulator, AggregateUDF, AggregateUDFImpl, ColumnarValue, ScalarUDF, ScalarUDFImpl,
+    Signature, Volatility,
 };
 use deltalake::datafusion::prelude::*;
 use std::any::Any;
@@ -25,13 +30,15 @@ use std::sync::Arc;
 /// Largest scale `spark_round` accepts (keeps the rounded digits in a u128).
 const MAX_ROUND_SCALE: i64 = 20;
 
-/// Make `spark_round(x, n)` and `spark_divide(a, b)` callable from SQL on `ctx`.
-/// A port that uses them in SQL calls this at the start of its `summarize`.
+/// Make `spark_round(x, n)`, `spark_divide(a, b)` and `spark_max_by(v, o)`
+/// callable from SQL on `ctx`. A port that uses them in SQL calls this at the
+/// start of its `summarize`.
 // Not every helper has a caller until the remaining jobs are ported.
 #[allow(dead_code)]
 pub fn register(ctx: &SessionContext) {
     ctx.register_udf(spark_round_udf());
     ctx.register_udf(spark_divide_udf());
+    ctx.register_udaf(spark_max_by_udaf());
 }
 
 /// Spark's `round(x, scale)` on a DOUBLE: HALF_UP on the value's shortest
@@ -62,6 +69,148 @@ pub fn spark_timestamp(value: Expr) -> Expr {
         value,
         DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
     )
+}
+
+/// Spark's `max_by(value, ord)` in a `groupBy.agg`: the `value` of the row
+/// with the largest `ord`. Rows with NULL `ord` are ignored; on `ord` ties the
+/// first row encountered wins (Spark's tie-break is arbitrary; ordering columns
+/// in these jobs are unique). DataFusion has no such aggregate.
+/// `value` may be NULL — it is kept as-is.
+pub fn spark_max_by(value: Expr, ord: Expr) -> Expr {
+    spark_max_by_udaf().call(vec![value, ord])
+}
+
+pub fn spark_max_by_udaf() -> AggregateUDF {
+    AggregateUDF::new_from_impl(SparkMaxBy {
+        signature: Signature::any(2, Volatility::Immutable),
+    })
+}
+
+#[derive(Debug)]
+struct SparkMaxBy {
+    signature: Signature,
+}
+
+impl AggregateUDFImpl for SparkMaxBy {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "spark_max_by"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[0].clone())
+    }
+
+    fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(MaxByAccumulator {
+            value_type: acc_args.return_type.clone(),
+            best_value: None,
+            best_ord: None,
+        }))
+    }
+
+    /// Intermediate state: [ord of the current winner, its value].
+    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<Field>> {
+        Ok([
+            Field::new(
+                format!("{}[ord]", args.name),
+                args.input_types[1].clone(),
+                true,
+            ),
+            Field::new(
+                format!("{}[value]", args.name),
+                args.return_type.clone(),
+                true,
+            ),
+        ]
+        .into_iter()
+        .chain(args.ordering_fields.to_vec())
+        .collect())
+    }
+}
+
+/// Keeps the value of the row with the largest ord so far (first seen on ties).
+#[derive(Debug)]
+struct MaxByAccumulator {
+    value_type: DataType,
+    best_value: Option<ScalarValue>,
+    best_ord: Option<ScalarValue>,
+}
+
+impl MaxByAccumulator {
+    /// `ord` must come first: `state()` and `merge_batch` pair up.
+    fn fold(&mut self, ord: ScalarValue, value: ScalarValue) {
+        // Spark ignores rows whose ordering expression is NULL.
+        if ord.is_null() {
+            return;
+        }
+        let wins = match &self.best_ord {
+            None => true,
+            Some(best) => ord > *best,
+        };
+        if wins {
+            self.best_ord = Some(ord);
+            self.best_value = Some(value);
+        }
+    }
+}
+
+impl Accumulator for MaxByAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        for i in 0..values[0].len() {
+            self.fold(
+                ScalarValue::try_from_array(&values[1], i)?,
+                ScalarValue::try_from_array(&values[0], i)?,
+            );
+        }
+        Ok(())
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        Ok(match &self.best_value {
+            Some(value) => value.clone(),
+            None => ScalarValue::try_from(&self.value_type)?,
+        })
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.best_value.as_ref().map_or(0, ScalarValue::size)
+            + self.best_ord.as_ref().map_or(0, ScalarValue::size)
+    }
+
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        let ord_type = self
+            .best_ord
+            .as_ref()
+            .map_or(DataType::Null, ScalarValue::data_type);
+        let value_type = &self.value_type;
+        Ok(vec![
+            self.best_ord
+                .clone()
+                .unwrap_or(ScalarValue::try_from(&ord_type)?),
+            self.best_value
+                .clone()
+                .unwrap_or(ScalarValue::try_from(value_type)?),
+        ])
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        for i in 0..states[0].len() {
+            self.fold(
+                ScalarValue::try_from_array(&states[0], i)?,
+                ScalarValue::try_from_array(&states[1], i)?,
+            );
+        }
+        Ok(())
+    }
 }
 
 pub fn spark_round_udf() -> ScalarUDF {
@@ -210,6 +359,21 @@ mod tests {
         let b =
             query("SELECT spark_round(x, 2) FROM (VALUES (2.675), (-1.005), (NULL)) t(x)").await;
         assert_eq!(doubles(&b, 0), [Some(2.68), Some(-1.01), None]);
+    }
+
+    #[tokio::test]
+    async fn max_by_picks_value_at_largest_ord() {
+        let b = query(
+            "SELECT spark_max_by(v, o) FROM (VALUES (1.0, 3), (2.0, 9), (3.0, 5), (4.0, CAST(NULL AS BIGINT))) t(v, o)",
+        )
+        .await;
+        assert_eq!(doubles(&b, 0), [Some(2.0)], "NULL ord must be ignored");
+        let b =
+            query("SELECT spark_max_by(v, o) FROM (VALUES (7.0, CAST(NULL AS BIGINT))) t(v, o)")
+                .await;
+        assert_eq!(doubles(&b, 0), [None], "all-NULL ord gives NULL");
+        let b = query("SELECT spark_max_by(v, o) FROM (VALUES (9.0, 1), (NULL, 2)) t(v, o)").await;
+        assert_eq!(doubles(&b, 0), [None], "NULL value is kept as-is");
     }
 
     #[tokio::test]
