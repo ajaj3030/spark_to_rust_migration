@@ -111,10 +111,11 @@ jobs it also requires exactly Spark's column names and types — the
 contract downstream readers depend on.
 
 **In CI (no Kafka or Spark needed).** `rust_pipeline/tests/fixtures/` holds
-a fixed slice of real pipeline output (150 vehicles) and the Scala jobs'
-output on that slice. Each job's parity test runs the Rust port on the same
-input and compares. Regenerate the expected outputs only when a Spark job
-changes (drop `--expected-only` to also resample the input):
+a fixed slice of real pipeline output (about 150 vehicles, with deliberate
+edge cases: missing days, null readings, vehicles without a state row) and
+the Scala jobs' output on that slice. Each job's parity test runs the Rust
+port on the same input and compares. Regenerate the expected outputs only
+when a Spark job changes; `--expected-only` keeps the curated input:
 
 ```bash
 docker exec -w /opt spark-master /opt/spark/bin/spark-submit --master 'local[*]' --jars $JARS \
@@ -192,6 +193,13 @@ Steps 4–8 can also be driven from the Streamlit dashboard:
 
 ```bash
 .venv/bin/streamlit run dashboard/app.py   # http://localhost:8501
+```
+
+Without Kafka or Spark, load the dashboard's tables from the committed test
+data instead (seconds; Rust analytics output and parity reports start empty):
+
+```bash
+.venv/bin/python scripts/load_demo_data.py
 ```
 
 | Page | What it shows |

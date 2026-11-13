@@ -8,6 +8,7 @@ use deltalake::datafusion::prelude::*;
 pub const JOB: Job = Job {
     name: "battery_health_daily",
     key_cols: &["vin_hash", "event_date"],
+    partition_cols: &["event_date"],
 };
 
 // TODO(migration): not ported yet.

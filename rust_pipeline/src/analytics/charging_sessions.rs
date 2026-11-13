@@ -8,6 +8,7 @@ use deltalake::datafusion::prelude::*;
 pub const JOB: Job = Job {
     name: "charging_sessions",
     key_cols: &["charge_session_id"],
+    partition_cols: &["session_date"],
 };
 
 // TODO(migration): not ported yet.

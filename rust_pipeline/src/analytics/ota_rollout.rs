@@ -8,6 +8,7 @@ use deltalake::datafusion::prelude::*;
 pub const JOB: Job = Job {
     name: "ota_rollout",
     key_cols: &["target_software_version", "model_safe"],
+    partition_cols: &[],
 };
 
 // TODO(migration): not ported yet.

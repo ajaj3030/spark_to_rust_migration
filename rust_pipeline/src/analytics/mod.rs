@@ -28,6 +28,8 @@ use std::sync::Arc;
 pub struct Job {
     pub name: &'static str,
     pub key_cols: &'static [&'static str],
+    /// Partition columns of the output table, the same as the Spark job's.
+    pub partition_cols: &'static [&'static str],
 }
 
 impl Job {
@@ -87,12 +89,74 @@ pub async fn run(job: &Job, cfg: &AppConfig) -> Result<()> {
     let batches = summarize(job, &ctx).await?.collect().await?;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     let output = cfg.rust_analytics_path(job.name);
-    crate::writer::ensure_parent_dir(&output)?;
-    DeltaOps::try_from_uri(&output)
+    write_output(&output, batches, job.partition_cols).await?;
+    tracing::info!("{}: wrote {} rows → {}", job.name, rows, output);
+    Ok(())
+}
+
+/// Overwrite a job's output table, partitioned the same way as Spark's.
+async fn write_output(
+    output: &str,
+    batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
+    partition_cols: &[&str],
+) -> Result<()> {
+    crate::writer::ensure_parent_dir(output)?;
+    DeltaOps::try_from_uri(output)
         .await?
         .write(batches)
         .with_save_mode(SaveMode::Overwrite)
+        .with_partition_columns(partition_cols.iter().map(|c| c.to_string()))
         .await?;
-    tracing::info!("{}: wrote {} rows → {}", job.name, rows, output);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deltalake::arrow::array::{Date32Array, Int64Array};
+    use deltalake::arrow::datatypes::{DataType, Field, Schema};
+    use deltalake::arrow::record_batch::RecordBatch;
+
+    #[test]
+    fn every_job_partitions_like_its_spark_job() {
+        let partitions: Vec<_> = JOBS.iter().map(|j| (j.name, j.partition_cols)).collect();
+        assert_eq!(
+            partitions,
+            vec![
+                ("battery_health_daily", &["event_date"][..]),
+                ("charging_sessions", &["session_date"][..]),
+                ("ota_rollout", &[][..]),
+                ("diagnostic_alerts", &[][..]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn output_table_is_partitioned_by_the_jobs_columns() {
+        let dir = std::env::temp_dir().join(format!("analytics-write-{}", std::process::id()));
+        let path = dir.to_string_lossy().into_owned();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("readings", DataType::Int64, false),
+            Field::new("event_date", DataType::Date32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Date32Array::from(vec![20_000, 20_001])),
+            ],
+        )
+        .unwrap();
+
+        write_output(&path, vec![batch], &["event_date"])
+            .await
+            .unwrap();
+
+        let table = deltalake::open_table(&path).await.unwrap();
+        assert_eq!(
+            table.metadata().unwrap().partition_columns,
+            vec!["event_date"]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
