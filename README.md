@@ -11,6 +11,17 @@ manifests in `deploy/k8s/`, and proven equivalent by a parity check. The
 four Scala Spark jobs that build the battery, charging, OTA and diagnostics
 tables are not ported yet.
 
+**What's where**
+
+| | |
+|---|---|
+| `spark_jobs/` | The Spark side: PySpark streaming jobs, and the four Scala analytics jobs in `spark_jobs/analytics/` |
+| `rust_pipeline/` | The Rust side: ported streams, and one placeholder per analytics job in `src/analytics/` |
+| `rust_pipeline/tests/fixtures/` | Spark's real output on a fixed data slice; every Rust port must match it exactly |
+| `dashboard/` | Fleet views and the migration tracker (Streamlit) |
+| `deploy/k8s/` | Kubernetes deployment for the Rust stream processors |
+| `.github/workflows/ci.yml` | CI: Rust, Scala, Python, Kubernetes and the container image |
+
 ## Provenance
 
 - **Forked from** [PragnaMohapatra/spark_to_rust_migration](https://github.com/PragnaMohapatra/spark_to_rust_migration)
