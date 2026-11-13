@@ -111,6 +111,7 @@ impl AggregateUDFImpl for SparkMaxBy {
     fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
         Ok(Box::new(MaxByAccumulator {
             value_type: acc_args.return_type.clone(),
+            ord_type: acc_args.exprs[1].data_type(acc_args.schema)?,
             best_value: None,
             best_ord: None,
         }))
@@ -140,6 +141,7 @@ impl AggregateUDFImpl for SparkMaxBy {
 #[derive(Debug)]
 struct MaxByAccumulator {
     value_type: DataType,
+    ord_type: DataType,
     best_value: Option<ScalarValue>,
     best_ord: Option<ScalarValue>,
 }
@@ -187,18 +189,18 @@ impl Accumulator for MaxByAccumulator {
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let ord_type = self
-            .best_ord
-            .as_ref()
-            .map_or(DataType::Null, ScalarValue::data_type);
-        let value_type = &self.value_type;
         Ok(vec![
-            self.best_ord
-                .clone()
-                .unwrap_or(ScalarValue::try_from(&ord_type)?),
-            self.best_value
-                .clone()
-                .unwrap_or(ScalarValue::try_from(value_type)?),
+            match &self.best_ord {
+                Some(ord) => ord.clone(),
+                // A typed NULL: the state field is the input ord type, so an
+                // untyped `ScalarValue::Null` would be rejected during
+                // partial aggregation.
+                None => ScalarValue::try_from(&self.ord_type)?,
+            },
+            match &self.best_value {
+                Some(value) => value.clone(),
+                None => ScalarValue::try_from(&self.value_type)?,
+            },
         ])
     }
 
@@ -372,6 +374,13 @@ mod tests {
             query("SELECT spark_max_by(v, o) FROM (VALUES (7.0, CAST(NULL AS BIGINT))) t(v, o)")
                 .await;
         assert_eq!(doubles(&b, 0), [None], "all-NULL ord gives NULL");
+        // Grouped aggregation goes through partial state: the all-NULL-ord
+        // group's state() must emit a typed NULL matching state_fields.
+        let b = query(
+            "SELECT g, spark_max_by(v, o) FROM (VALUES ('a', 7.0, CAST(NULL AS BIGINT)), ('b', 1.0, 4), ('b', 2.0, 6)) t(g, v, o) GROUP BY g ORDER BY g",
+        )
+        .await;
+        assert_eq!(doubles(&b, 1), [None, Some(2.0)]);
         let b = query("SELECT spark_max_by(v, o) FROM (VALUES (9.0, 1), (NULL, 2)) t(v, o)").await;
         assert_eq!(doubles(&b, 0), [None], "NULL value is kept as-is");
     }
