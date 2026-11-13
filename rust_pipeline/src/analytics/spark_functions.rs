@@ -13,7 +13,7 @@
 use crate::transforms::rounding;
 use deltalake::arrow::array::Float64Array;
 use deltalake::arrow::datatypes::{DataType, Float64Type, TimeUnit};
-use deltalake::datafusion::common::cast::as_float64_array;
+use deltalake::datafusion::common::cast::{as_float64_array, as_string_array};
 use deltalake::datafusion::common::{exec_err, Result, ScalarValue};
 use deltalake::datafusion::logical_expr::{
     ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
@@ -32,6 +32,7 @@ const MAX_ROUND_SCALE: i64 = 20;
 pub fn register(ctx: &SessionContext) {
     ctx.register_udf(spark_round_udf());
     ctx.register_udf(spark_divide_udf());
+    ctx.register_udf(spark_sha2_udf());
 }
 
 /// Spark's `round(x, scale)` on a DOUBLE: HALF_UP on the value's shortest
@@ -62,6 +63,74 @@ pub fn spark_timestamp(value: Expr) -> Expr {
         value,
         DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
     )
+}
+
+/// Spark's `sha2(x, 256)`: lowercase hex string of the SHA-256 digest.
+/// DataFusion's `sha256` returns Binary, and `encode(digest, 'hex')` first
+/// coerces the digest to Utf8 (rejecting/mangling non-UTF8 bytes), so the
+/// hex encoding has to happen inside one UDF.
+#[allow(dead_code)]
+pub fn spark_sha2(value: Expr) -> Expr {
+    spark_sha2_udf().call(vec![value])
+}
+
+pub fn spark_sha2_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(SparkSha2 {
+        signature: Signature::user_defined(Volatility::Immutable),
+    })
+}
+
+#[derive(Debug)]
+struct SparkSha2 {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for SparkSha2 {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "spark_sha2"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        match arg_types {
+            [DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Null] => {
+                Ok(vec![DataType::Utf8])
+            }
+            [other] => exec_err!("spark_sha2: expected a string column, got {other}"),
+            _ => exec_err!("spark_sha2 takes 1 argument, got {}", arg_types.len()),
+        }
+    }
+
+    fn invoke_batch(&self, args: &[ColumnarValue], _number_rows: usize) -> Result<ColumnarValue> {
+        use deltalake::arrow::array::StringArray;
+        use sha2::Digest;
+        let hex = |s: &str| format!("{:x}", sha2::Sha256::digest(s.as_bytes()));
+        match &args[0] {
+            ColumnarValue::Scalar(ScalarValue::Utf8(s)) => Ok(ColumnarValue::Scalar(
+                ScalarValue::Utf8(s.as_ref().map(|s| hex(s))),
+            )),
+            ColumnarValue::Array(values) => {
+                let strings = as_string_array(values)?;
+                let hashed: StringArray = strings.iter().map(|opt| opt.map(hex)).collect();
+                Ok(ColumnarValue::Array(Arc::new(hashed)))
+            }
+            other => exec_err!(
+                "spark_sha2: expected a string column, got {}",
+                other.data_type()
+            ),
+        }
+    }
 }
 
 pub fn spark_round_udf() -> ScalarUDF {
@@ -222,6 +291,34 @@ mod tests {
         let b = query("SELECT spark_divide(1.0, 0.0), spark_divide(-0.0, 1.0)").await;
         assert_eq!(doubles(&b, 0), [None]);
         assert_eq!(doubles(&b, 1), [Some(-0.0)]);
+    }
+
+    #[tokio::test]
+    async fn sha2_gives_lowercase_hex() {
+        let b =
+            query("SELECT spark_sha2(''), spark_sha2('VIN123'), spark_sha2(CAST(NULL AS VARCHAR))")
+                .await;
+        let col = |i: usize| {
+            b.column(i)
+                .as_any()
+                .downcast_ref::<deltalake::arrow::array::StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            col(0),
+            [Some(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            )]
+        );
+        assert_eq!(
+            col(1),
+            [Some(
+                "540b8f09afc89b842c2a048e8f1d624d3b21c5265399c808709348f09957ecc3"
+            )]
+        );
+        assert_eq!(col(2), [None]);
     }
 
     #[tokio::test]
