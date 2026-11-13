@@ -6,9 +6,9 @@ use super::spark_functions::{
 };
 use super::Job;
 use anyhow::Result;
-use deltalake::arrow::datatypes::DataType;
-use deltalake::datafusion::functions::expr_fn::to_timestamp;
+use deltalake::arrow::datatypes::{DataType, TimeUnit};
 use deltalake::datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
+use deltalake::datafusion::logical_expr::expr_fn::try_cast;
 use deltalake::datafusion::prelude::*;
 
 pub const JOB: Job = Job {
@@ -17,9 +17,13 @@ pub const JOB: Job = Job {
 };
 
 pub async fn summarize(ctx: &SessionContext) -> Result<DataFrame> {
-    // Spark `to_timestamp` parses event_time strings; cast to Spark's
-    // timestamp[us, UTC] before aggregating so the output type matches.
-    let event_time = spark_timestamp(to_timestamp(vec![col("event_time")]));
+    // Spark `to_timestamp` parses event_time strings and returns NULL on
+    // malformed input; `try_cast` does the same where `to_timestamp` would
+    // error, then cast to Spark's timestamp[us, UTC] for the output type.
+    let event_time = spark_timestamp(try_cast(
+        col("event_time"),
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+    ));
 
     // One row per charge_session_id; Spark groupBy keeps NULL keys, so the
     // is_not_null filter (not the group) is what drops them.
