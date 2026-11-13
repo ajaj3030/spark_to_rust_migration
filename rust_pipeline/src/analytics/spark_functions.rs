@@ -11,15 +11,19 @@
 //! | timestamps are `timestamp[us, UTC]`             | `to_timestamp` gives `timestamp[ns]` | [`spark_timestamp`] |
 
 use crate::transforms::rounding;
-use deltalake::arrow::array::Float64Array;
-use deltalake::arrow::datatypes::{DataType, Float64Type, TimeUnit};
+use deltalake::arrow::array::{Array, ArrayRef, Float64Array};
+use deltalake::arrow::datatypes::{DataType, Field, Float64Type, TimeUnit};
 use deltalake::datafusion::common::cast::as_float64_array;
 use deltalake::datafusion::common::{exec_err, Result, ScalarValue};
+use deltalake::datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
+use deltalake::datafusion::logical_expr::utils::format_state_name;
 use deltalake::datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    Accumulator, AggregateUDF, AggregateUDFImpl, ColumnarValue, ScalarUDF, ScalarUDFImpl,
+    Signature, Volatility,
 };
 use deltalake::datafusion::prelude::*;
 use std::any::Any;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 /// Largest scale `spark_round` accepts (keeps the rounded digits in a u128).
@@ -32,6 +36,8 @@ const MAX_ROUND_SCALE: i64 = 20;
 pub fn register(ctx: &SessionContext) {
     ctx.register_udf(spark_round_udf());
     ctx.register_udf(spark_divide_udf());
+    ctx.register_udaf(spark_max_by_udaf());
+    ctx.register_udaf(spark_min_by_udaf());
 }
 
 /// Spark's `round(x, scale)` on a DOUBLE: HALF_UP on the value's shortest
@@ -71,6 +77,156 @@ pub fn spark_round_udf() -> ScalarUDF {
             Volatility::Immutable,
         ),
     })
+}
+
+/// Spark's `max_by(value, ordering)` / `min_by(value, ordering)` (DataFusion
+/// has neither): the `value` of the row with the greatest / smallest
+/// `ordering`. Rows with a NULL ordering are ignored, so the result is NULL
+/// when every ordering in the group is NULL. On ordering ties the first row
+/// seen wins, matching Spark's replace-on-strictly-greater update.
+pub fn spark_max_by(value: Expr, ordering: Expr) -> Expr {
+    spark_max_by_udaf().call(vec![value, ordering])
+}
+
+/// See [`spark_max_by`].
+#[allow(dead_code)]
+pub fn spark_min_by(value: Expr, ordering: Expr) -> Expr {
+    spark_min_by_udaf().call(vec![value, ordering])
+}
+
+pub fn spark_max_by_udaf() -> AggregateUDF {
+    AggregateUDF::new_from_impl(SparkMinMaxBy {
+        name: "spark_max_by",
+        is_max: true,
+        signature: Signature::any(2, Volatility::Immutable),
+    })
+}
+
+pub fn spark_min_by_udaf() -> AggregateUDF {
+    AggregateUDF::new_from_impl(SparkMinMaxBy {
+        name: "spark_min_by",
+        is_max: false,
+        signature: Signature::any(2, Volatility::Immutable),
+    })
+}
+
+#[derive(Debug)]
+struct SparkMinMaxBy {
+    name: &'static str,
+    is_max: bool,
+    signature: Signature,
+}
+
+impl AggregateUDFImpl for SparkMinMaxBy {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        arg_types.first().cloned().ok_or_else(|| {
+            deltalake::datafusion::error::DataFusionError::Plan(format!(
+                "{} takes 2 arguments",
+                self.name
+            ))
+        })
+    }
+
+    fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        let ordering_type = acc_args
+            .exprs
+            .get(1)
+            .map(|e| e.data_type(acc_args.schema))
+            .transpose()?;
+        Ok(Box::new(MinMaxByAccumulator {
+            is_max: self.is_max,
+            value: ScalarValue::try_from(acc_args.return_type)?,
+            ordering: ScalarValue::try_from(ordering_type.as_ref().unwrap_or(&DataType::Null))?,
+        }))
+    }
+
+    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<Field>> {
+        Ok(vec![
+            Field::new(
+                format_state_name(args.name, "value"),
+                args.return_type.clone(),
+                true,
+            ),
+            Field::new(
+                format_state_name(args.name, "ordering"),
+                args.input_types.get(1).cloned().unwrap_or(DataType::Null),
+                true,
+            ),
+        ])
+    }
+}
+
+#[derive(Debug)]
+struct MinMaxByAccumulator {
+    is_max: bool,
+    value: ScalarValue,
+    ordering: ScalarValue,
+}
+
+impl MinMaxByAccumulator {
+    /// One row of state: keep `value` when `ordering` beats the stored one.
+    /// A NULL ordering means "no row seen yet" (the stored value is also NULL
+    /// then) or is Spark's ignored-null-ordering case.
+    fn consider(&mut self, value: ScalarValue, ordering: ScalarValue) -> Result<()> {
+        if ordering.is_null() {
+            return Ok(());
+        }
+        let beats = self.ordering.is_null()
+            || match self.ordering.partial_cmp(&ordering) {
+                Some(Ordering::Less) => self.is_max,
+                Some(Ordering::Greater) => !self.is_max,
+                // Equal or incomparable: keep the first row seen, like Spark.
+                _ => false,
+            };
+        if beats {
+            self.value = value;
+            self.ordering = ordering;
+        }
+        Ok(())
+    }
+}
+
+impl Accumulator for MinMaxByAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        let [values, orderings] = values else {
+            return exec_err!("max_by/min_by take 2 arguments, got {}", values.len());
+        };
+        for i in 0..values.len() {
+            self.consider(
+                ScalarValue::try_from_array(values.as_ref(), i)?,
+                ScalarValue::try_from_array(orderings.as_ref(), i)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        self.update_batch(states)
+    }
+
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        Ok(vec![self.value.clone(), self.ordering.clone()])
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        Ok(self.value.clone())
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self) + self.value.size() + self.ordering.size()
+    }
 }
 
 pub fn spark_divide_udf() -> ScalarUDF {
@@ -222,6 +378,32 @@ mod tests {
         let b = query("SELECT spark_divide(1.0, 0.0), spark_divide(-0.0, 1.0)").await;
         assert_eq!(doubles(&b, 0), [None]);
         assert_eq!(doubles(&b, 1), [Some(-0.0)]);
+    }
+
+    #[tokio::test]
+    async fn max_by_min_by_pick_value_at_extreme_ordering() {
+        let b = query(
+            "SELECT spark_max_by(v, o), spark_min_by(v, o) FROM (VALUES (10.0, 1), (30.0, 3), (20.0, 2), (99.0, NULL), (NULL, 4)) t(v, o)",
+        )
+        .await;
+        // Greatest non-NULL ordering is 4, whose value is NULL; smallest is 1.
+        assert_eq!(doubles(&b, 0), [None]);
+        assert_eq!(doubles(&b, 1), [Some(10.0)]);
+    }
+
+    #[tokio::test]
+    async fn max_by_keeps_first_row_on_ordering_ties() {
+        let b = query(
+            "SELECT spark_max_by(s, o) FROM (VALUES ('first', 5), ('second', 5), ('other', 1)) t(s, o)",
+        )
+        .await;
+        let col = b.column(0);
+        assert_eq!(col.data_type(), &DataType::Utf8);
+        let s = col
+            .as_any()
+            .downcast_ref::<deltalake::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(s.value(0), "first");
     }
 
     #[tokio::test]
