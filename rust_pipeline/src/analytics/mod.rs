@@ -132,6 +132,28 @@ mod tests {
         );
     }
 
+    /// Parquet written by arrow-rs 57+ (e.g. Python deltalake >= 1.3) encodes the
+    /// page index's bool lists in a form parquet < 54 rejects as "bad data".
+    #[tokio::test]
+    async fn reads_page_index_written_by_newer_arrow_rs() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/compat/arrow_rs_57_writer"
+        );
+        let ctx = SessionContext::new();
+        ctx.register_parquet("t", path, ParquetReadOptions::default())
+            .await
+            .unwrap();
+        let rows = ctx
+            .sql("SELECT * FROM t WHERE charge_session_id IS NOT NULL")
+            .await
+            .unwrap()
+            .count()
+            .await
+            .unwrap();
+        assert_eq!(rows, 2);
+    }
+
     #[tokio::test]
     async fn output_table_is_partitioned_by_the_jobs_columns() {
         let dir = std::env::temp_dir().join(format!("analytics-write-{}", std::process::id()));
