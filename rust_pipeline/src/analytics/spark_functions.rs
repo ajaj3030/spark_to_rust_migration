@@ -322,7 +322,11 @@ pub fn parse_spark_timestamp(s: &str) -> Option<i64> {
     let hour = digits(hms.next()?, 1, 2)?;
     let minute = hms.next().map_or(Some(0), |m| digits(m, 1, 2))?;
     let second = hms.next().map_or(Some(0), |s| digits(s, 1, 2))?;
-    if hms.next().is_some() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+    let has_fraction = rest[..time_end].contains('.');
+    if hms.next().is_some()
+        || (has_fraction && clock.matches(':').count() != 2)
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     let micros: u32 = format!("{:0<6}", &fraction[..fraction.len().min(6)])
@@ -746,6 +750,8 @@ mod tests {
             ("2026", Some("2026-01-01T00:00:00Z")),
             ("02026-11-05", Some("2026-11-05T00:00:00Z")),
             ("2026-11-05T23:23:51z", None),
+            ("2026-11-05T12.5", None),
+            ("2026-11-05T12:30.5", None),
             ("2026-11-05T12:30:15+1\u{20ac}", None),
             ("2026-11-05T12:30:15+1\u{e9}", None),
             ("2026-02-30T00:00:00Z", None),
