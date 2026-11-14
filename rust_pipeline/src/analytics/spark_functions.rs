@@ -460,6 +460,9 @@ struct ExtremeByAccumulator {
 
 impl ExtremeByAccumulator {
     fn absorb(&mut self, values: &ArrayRef, orderings: &ArrayRef) -> Result<()> {
+        if orderings.data_type() == &DataType::Null {
+            return Ok(());
+        }
         let options = SortOptions {
             descending: self.keep == Ordering::Greater,
             nulls_first: false,
@@ -667,6 +670,15 @@ mod tests {
         assert_eq!(strings(&out, 1), vec![None, None, Some("nan")]);
         assert_eq!(strings(&out, 2), vec![None, Some("x"), Some("neg")]);
         assert_eq!(out.schema().field(1).data_type(), &DataType::Utf8);
+
+        // Spark: max_by(x, NULL) / min_by(x, NULL) -> NULL.
+        let out = query(
+            &ctx,
+            "SELECT g, max_by(v, NULL), min_by(v, NULL) FROM t GROUP BY g ORDER BY g",
+        )
+        .await;
+        assert_eq!(strings(&out, 1), vec![None, None, None]);
+        assert_eq!(strings(&out, 2), vec![None, None, None]);
     }
 
     #[tokio::test]
