@@ -343,6 +343,9 @@ fn digits(s: &str, min: usize, max: usize) -> Option<u32> {
 
 /// Offset east of UTC, in seconds.
 fn parse_zone(zone: &str) -> Option<i64> {
+    if !zone.is_ascii() {
+        return None;
+    }
     let offset = ["UTC", "GMT", "UT", "Z"]
         .iter()
         .find_map(|prefix| zone.strip_prefix(prefix))
@@ -743,6 +746,8 @@ mod tests {
             ("2026", Some("2026-01-01T00:00:00Z")),
             ("02026-11-05", Some("2026-11-05T00:00:00Z")),
             ("2026-11-05T23:23:51z", None),
+            ("2026-11-05T12:30:15+1\u{20ac}", None),
+            ("2026-11-05T12:30:15+1\u{e9}", None),
             ("2026-02-30T00:00:00Z", None),
             ("2026-13-01", None),
             ("2026-11-05T24:00:00", None),
