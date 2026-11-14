@@ -13,6 +13,7 @@ pub mod battery_health_daily;
 pub mod charging_sessions;
 pub mod diagnostic_alerts;
 pub mod ota_rollout;
+pub mod spark_functions;
 
 #[cfg(test)]
 pub mod parity;
