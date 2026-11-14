@@ -1,5 +1,21 @@
 //! Rust port of the Spark job
 //! spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala
+//!
+//! Spark behaviours reproduced:
+//! - `orderBy(col("sequence_number").desc)` is NULLS LAST in Spark, but
+//!   DataFusion's `DESC` defaults to NULLS FIRST. The window says `NULLS LAST`
+//!   explicitly so a NULL `sequence_number` never wins `row_number() = 1`.
+//! - A NULL `target_software_version` is an ordinary partition/group key.
+//! - `pivot(update_state, UpdateStates).count().na.fill(0)` uses a fixed value
+//!   list, so the columns are always the seven states in that order. A group
+//!   whose latest states are all NULL or outside the list is still emitted,
+//!   with all-zero counts. Counts and `vehicles` are non-null `bigint` (`Int64`).
+//! - `round(a / b * 100, 2)` divides first, then scales (`1/3*100` is not the
+//!   same double as `100/3`). It returns NULL when `vehicles = 0`
+//!   (`spark_divide`) and rounds HALF_UP on the decimal value (`spark_round`),
+//!   so `0.285` becomes `0.29` where DataFusion's `round` gives `0.28`.
+//! - Output columns follow Spark's order: group keys, pivot states,
+//!   `vehicles`, `success_rate_pct`, `failure_rate_pct`.
 
 use super::{spark_functions, Job};
 use anyhow::Result;
